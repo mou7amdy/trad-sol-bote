@@ -2,17 +2,8 @@
 """
 Enhancement 3 — Rug Pull Pattern Recognition
 
-Combines on-chain holder concentration, price-history volatility (used as a
-liquidity-drop proxy), and token age vs. liquidity ratio into a probabilistic
-rug score.
-
-NOTE on liquidity proxy
------------------------
-Birdeye's ``defi/history_price`` (5 m candles) is used to detect sudden price
-collapses as a *proxy* for liquidity removal events, because the liquidity
-time-series endpoint requires a paid Birdeye tier.  A >20 % price drop in a
-single 5-minute candle is flagged as a suspicious drop.  This produces some
-false positives on high-volatility tokens, but errs on the safe side.
+Combines on-chain holder concentration, DexScreener price-change volatility,
+and token age vs. liquidity ratio into a probabilistic rug score.
 """
 
 import asyncio
@@ -37,7 +28,7 @@ class RugAnalysis:
 
 class RugDetector:
     """
-    Analyses a Solana token for rug-pull patterns using Birdeye and Helius.
+    Analyses a Solana token for rug-pull patterns using DexScreener + Helius.
 
     Every individual check method is fully exception-safe and returns a safe
     default dict on failure so the master ``analyze_rug_risk`` always has data
@@ -46,17 +37,10 @@ class RugDetector:
 
     def __init__(self) -> None:
         self._rpc_url: str = settings.SOLANA_RPC_URL
-        self._birdeye_key: str = getattr(settings, "BIRDEYE_API_KEY", "")
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    def _birdeye_headers(self) -> dict[str, str]:
-        headers: dict[str, str] = {"x-chain": "solana"}
-        if self._birdeye_key and not self._birdeye_key.startswith("your_"):
-            headers["X-API-KEY"] = self._birdeye_key
-        return headers
 
     async def _post_rpc(self, payload: dict) -> Optional[Any]:
         """POST a JSON-RPC request and return the ``result`` field."""
@@ -78,16 +62,19 @@ class RugDetector:
             logger.error(f"RugDetector RPC error [{payload.get('method')}]: {exc}")
         return None
 
-    async def _get_birdeye(self, url: str) -> Optional[dict]:
-        """GET a Birdeye endpoint and return the ``data`` field."""
+    async def _fetch_dexscreener(self, token_address: str) -> Optional[dict]:
+        """Fetch DexScreener data for price-change analysis."""
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url, headers=self._birdeye_headers())
+                resp = await client.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}")
                 if resp.status_code == 200:
-                    return resp.json().get("data")
-                logger.warning(f"HTTP {resp.status_code} from Birdeye [{url}]")
+                    data = resp.json()
+                    pairs = [p for p in (data.get("pairs") or []) if p.get("chainId") == "solana"]
+                    if pairs:
+                        best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                        return best
         except Exception as exc:
-            logger.error(f"RugDetector Birdeye GET error: {exc}")
+            logger.error(f"_fetch_dexscreener error: {exc}")
         return None
 
     # ------------------------------------------------------------------
@@ -96,54 +83,31 @@ class RugDetector:
 
     async def check_liquidity_removal_pattern(self, token_address: str) -> dict:
         """
-        Fetch 5-minute price candles from Birdeye and detect sudden drops
-        of more than 20 % between consecutive candles.
-
-        A large price collapse is used as a proxy for liquidity removal because
-        the Birdeye free tier does not expose a liquidity time-series endpoint.
+        Fetch price-change data from DexScreener and detect large drops.
+        Uses the ``priceChange.m5`` field as a liquidity-removal proxy.
 
         Returns::
 
             {"suspicious_drops": int, "max_drop_pct": float}
         """
         _safe = {"suspicious_drops": 0, "max_drop_pct": 0.0}
-        url = (
-            f"https://public-api.birdeye.so/defi/history_price"
-            f"?address={token_address}&address_type=token&type=5m"
-        )
         try:
-            data = await self._get_birdeye(url)
-            if not data:
+            pair = await self._fetch_dexscreener(token_address)
+            if not pair:
                 return _safe
 
-            items: list[dict] = data.get("items", [])
-            if len(items) < 2:
-                return _safe
-
-            values: list[float] = [
-                float(item.get("value", 0.0)) for item in items
-            ]
-            suspicious_drops = 0
-            max_drop_pct = 0.0
-
-            for i in range(1, len(values)):
-                prev = values[i - 1]
-                curr = values[i]
-                if prev <= 0.0:
-                    continue
-                drop_pct = ((prev - curr) / prev) * 100.0
-                if drop_pct > 20.0:
-                    suspicious_drops += 1
-                    if drop_pct > max_drop_pct:
-                        max_drop_pct = drop_pct
-
-            logger.debug(
-                f"Price-drop proxy for {token_address}: "
-                f"drops={suspicious_drops}, max_drop={max_drop_pct:.1f}%"
-            )
+            price_change = pair.get("priceChange", {})
+            drops = 0
+            max_drop = 0.0
+            for tick in ("m5", "h1", "h6"):
+                pct = float(price_change.get(tick, 0) or 0)
+                if pct < -20.0:
+                    drops += 1
+                    max_drop = min(max_drop, pct)  # more negative = worse
+            max_drop = abs(max_drop) if max_drop < 0 else 0.0
             return {
-                "suspicious_drops": suspicious_drops,
-                "max_drop_pct": round(max_drop_pct, 2),
+                "suspicious_drops": drops,
+                "max_drop_pct": round(max_drop, 2),
             }
         except Exception as exc:
             logger.error(f"check_liquidity_removal_pattern error: {exc}")

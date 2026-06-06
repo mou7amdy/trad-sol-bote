@@ -37,6 +37,10 @@ def main():
             "Set real values in .env for live operations."
         )
     try:
+        settings.validate_api_keys()
+    except ValueError as e:
+        logger.warning(f"API key validation: {e}")
+    try:
         asyncio.run(_run_all())
     except KeyboardInterrupt:
         logger.info("Stopped by user.")

@@ -743,11 +743,11 @@ class BacktestReporter:
             return False
         try:
             data = json.loads(OPT_PARAMS_PATH.read_text())
-            from config.settings import settings
+            from config.settings import runtime_state
             min_score = float(data.get("min_signal_score", 0.72))
-            settings.MIN_SIGNAL_SCORE_FOR_BUY = min_score
+            runtime_state.min_signal_score_for_buy = min_score * 100.0 if min_score <= 1.0 else min_score
             pos_size = float(data.get("position_size_sol", 0.05))
-            settings.MAX_POSITION_SIZE_SOL = pos_size
+            runtime_state.max_position_size_sol = pos_size
             logger.info(
                 f"BacktestReporter: applied optimal params — "
                 f"score_threshold={min_score} pos_size={pos_size} SOL"

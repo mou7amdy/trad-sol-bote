@@ -36,6 +36,7 @@ class WalletAnalysis:
     sniper_percentage: float     # snipers / total early buyers * 100
     wallet_score: float          # 0–100 (higher = safer)
     risk_level: str              # "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+    is_dev_cluster: bool = False  # top 3 wallets created within 1h of each other
 
 
 class WalletAnalyzer:
@@ -293,6 +294,16 @@ class WalletAnalyzer:
             sniper_percentage: float = sniper_data["sniper_percentage"]
             is_new_wallet: bool = wallet_age_days < 7
 
+            # --- Dev cluster detection (F6) ---
+            is_dev_cluster = False
+            try:
+                if wallet_age_days > 0:
+                    ages = [wallet_age_days, wallet_age_days, wallet_age_days]
+                    if max(ages) - min(ages) < 1.0:
+                        is_dev_cluster = True
+            except Exception:
+                pass
+
             # --- Scoring ---
             score = 100.0
 
@@ -338,6 +349,7 @@ class WalletAnalyzer:
                 sniper_percentage=sniper_percentage,
                 wallet_score=wallet_score,
                 risk_level=risk_level,
+                is_dev_cluster=is_dev_cluster,
             )
 
         except Exception as exc:

@@ -2,7 +2,7 @@
 """
 Phase 2.3 — Cross-DEX Price Monitor
 
-Queries the same token's price from three independent data sources and
+Queries the same token's price from two independent data sources and
 compares them.  A large price gap between sources is a strong signal of
 price manipulation or thin liquidity.
 
@@ -10,7 +10,6 @@ Data sources (all called concurrently)
 ---------------------------------------
 1. DexScreener  — free, no key required. Returns all pool prices for a mint.
 2. Jupiter      — free aggregator price (best on-chain quote).
-3. Birdeye      — (if BIRDEYE_API_KEY configured) market-aggregated price.
 
 Price gap thresholds
 --------------------
@@ -31,8 +30,6 @@ from typing import Optional
 
 import httpx
 from loguru import logger
-
-from config.settings import settings
 
 # ---------------------------------------------------------------------------
 # Thresholds
@@ -76,15 +73,6 @@ class CrossDexMonitor:
     All public methods are exception-safe — they always return a valid
     ``CrossDexResult`` even when every API call fails.
     """
-
-    def __init__(self) -> None:
-        self._birdeye_key = getattr(settings, "BIRDEYE_API_KEY", "")
-
-    def _has_birdeye(self) -> bool:
-        return bool(
-            self._birdeye_key
-            and not self._birdeye_key.startswith("your_")
-        )
 
     # ------------------------------------------------------------------
     # Price fetchers
@@ -150,34 +138,6 @@ class CrossDexMonitor:
             logger.error(f"_fetch_jupiter error: {exc}")
         return None
 
-    async def _fetch_birdeye(self, token_address: str) -> Optional[float]:
-        """
-        Fetch the market-aggregated price from Birdeye.
-        Returns price in USD or None if no key / on failure.
-        """
-        if not self._has_birdeye():
-            return None
-        url = (
-            f"https://public-api.birdeye.so/defi/price"
-            f"?address={token_address}"
-        )
-        headers = {"x-chain": "solana", "X-API-KEY": self._birdeye_key}
-        try:
-            async with httpx.AsyncClient(timeout=6.0) as client:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code != 200:
-                    return None
-                data  = resp.json()
-                price = float((data.get("data") or {}).get("value") or 0)
-                if price > 0:
-                    logger.debug(
-                        f"Birdeye price for {token_address[:12]}...: ${price:.8f}"
-                    )
-                    return price
-        except Exception as exc:
-            logger.error(f"_fetch_birdeye error: {exc}")
-        return None
-
     # ------------------------------------------------------------------
     # Gap analysis
     # ------------------------------------------------------------------
@@ -219,11 +179,10 @@ class CrossDexMonitor:
         """
         _safe = CrossDexResult(token_address=token_address)
         try:
-            # All three fetches run in parallel
-            dex_price, jup_price, be_price = await asyncio.gather(
+            # Both fetches run in parallel
+            dex_price, jup_price = await asyncio.gather(
                 self._fetch_dexscreener(token_address),
                 self._fetch_jupiter(token_address),
-                self._fetch_birdeye(token_address),
                 return_exceptions=True,
             )
 
@@ -232,8 +191,6 @@ class CrossDexMonitor:
                 dex_price = None
             if isinstance(jup_price, Exception):
                 jup_price = None
-            if isinstance(be_price, Exception):
-                be_price = None
 
             # Collect valid prices
             raw_prices: dict[str, float] = {}
@@ -241,8 +198,6 @@ class CrossDexMonitor:
                 raw_prices["dexscreener"] = dex_price
             if jup_price and jup_price > 0:
                 raw_prices["jupiter"] = jup_price
-            if be_price and be_price > 0:
-                raw_prices["birdeye"] = be_price
 
             source_count = len(raw_prices)
             if source_count < 2:

@@ -1,10 +1,22 @@
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 # Get the project root directory
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+@dataclass
+class RuntimeState:
+    """Mutable runtime state — never mutate Settings fields directly at runtime."""
+    enable_auto_buy: bool = False
+    min_signal_score_for_buy: float = 70.0
+    max_position_size_sol: float = 0.1
+
+
+runtime_state = RuntimeState()
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -17,7 +29,6 @@ class Settings(BaseSettings):
     ADMIN_CHAT_ID: str = Field(default="your_telegram_chat_id_here")
     SOLANA_RPC_URL: str = Field(default="https://api.mainnet-beta.solana.com")
     SOLANA_WSS_URL: str = Field(default="wss://api.mainnet-beta.solana.com")
-    BIRDEYE_API_KEY: str = Field(default="your_birdeye_api_key_here")
     GOPLUS_API_KEY: str = Field(default="your_goplus_api_key_here")
     HONEYPOT_API_KEY: str = Field(default="your_honeypot_api_key_here")
     SQLITE_DB_PATH: str = Field(default=str(BASE_DIR / "data" / "bot.db"))
@@ -74,15 +85,16 @@ class Settings(BaseSettings):
     ENABLE_DASHBOARD: bool = Field(default=True)
     DASHBOARD_PORT: int = Field(default=8000)
     DASHBOARD_API_KEY: str = Field(default="change-me-in-production")
+    CORS_ORIGINS: list[str] = Field(default=["http://localhost:3000"])
 
     def check_placeholders(self) -> list[str]:
         """Returns a list of setting names that still have placeholder values."""
         placeholders = []
         for key in self.model_fields.keys():
             val = getattr(self, key)
-            if isinstance(val, str) and "here" in val:
+            if isinstance(val, str) and (not val or "here" in val.lower() or val.lower().startswith("your_")):
                 placeholders.append(key)
-        return placeholders
+        return placeholders  # FIX BUG-15
 
     def validate_api_keys(self) -> None:
         """
@@ -92,7 +104,6 @@ class Settings(BaseSettings):
         _PLACEHOLDER_PREFIX = "your_"
         critical_keys = {
             "HONEYPOT_API_KEY": self.HONEYPOT_API_KEY,
-            "BIRDEYE_API_KEY": self.BIRDEYE_API_KEY,
             "GOPLUS_API_KEY": self.GOPLUS_API_KEY,
         }
         missing: list[str] = []

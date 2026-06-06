@@ -42,9 +42,17 @@ _db_connection: Optional[aiosqlite.Connection] = None
 
 async def _get_db() -> aiosqlite.Connection:
     """Return the shared database connection, raising if not yet initialised."""
+    global _db_connection  # FIX BUG-16
     if _db_connection is None:
         raise RuntimeError("Database not initialised. Call init_db() first.")
-    return _db_connection
+    try:
+        await _db_connection.execute("SELECT 1")
+    except Exception:
+        logger.warning("DB connection lost, reconnecting...")
+        _db_connection = await aiosqlite.connect(settings.SQLITE_DB_PATH)
+        _db_connection.row_factory = aiosqlite.Row
+        await _db_connection.execute("PRAGMA journal_mode = WAL;")
+    return _db_connection  # FIX BUG-16
 
 
 async def init_db() -> None:
@@ -240,49 +248,55 @@ async def get_recent_signals(limit: int = 10) -> List[Dict[str, Any]]:
 
 async def save_wallet_analysis(data: Dict[str, Any]) -> None:
     """Persist a WalletAnalysis result to the wallet_analyses table."""
-    db = await _get_db()
-    await db.execute(
-        """
-        INSERT INTO wallet_analyses (
-            token_address, creator_wallet, wallet_age_days,
-            sniper_count, sniper_percentage, wallet_score, risk_level
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["token_address"],
-            data.get("creator_wallet", ""),
-            data.get("wallet_age_days", 0),
-            data.get("sniper_count", 0),
-            data.get("sniper_percentage", 0.0),
-            data.get("wallet_score", 0.0),
-            data.get("risk_level", "UNKNOWN"),
-        ),
-    )
-    await db.commit()
-    logger.debug(f"Saved wallet_analysis for token {data['token_address']}")
+    try:
+        db = await _get_db()
+        await db.execute(
+            """
+            INSERT INTO wallet_analyses (
+                token_address, creator_wallet, wallet_age_days,
+                sniper_count, sniper_percentage, wallet_score, risk_level
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["token_address"],
+                data.get("creator_wallet", ""),
+                data.get("wallet_age_days", 0),
+                data.get("sniper_count", 0),
+                data.get("sniper_percentage", 0.0),
+                data.get("wallet_score", 0.0),
+                data.get("risk_level", "UNKNOWN"),
+            ),
+        )
+        await db.commit()
+        logger.debug(f"Saved wallet_analysis for token {data['token_address']}")
+    except Exception as exc:
+        logger.error(f"Error saving wallet_analysis: {exc}")
 
 
 async def save_social_signals(data: Dict[str, Any]) -> None:
     """Persist a SocialSignals result to the social_signals table."""
-    db = await _get_db()
-    await db.execute(
-        """
-        INSERT INTO social_signals (
-            token_address, mention_count_1h, mention_velocity,
-            sentiment_score, has_viral_tweet, social_score
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["token_address"],
-            data.get("mention_count_1h", 0),
-            data.get("mention_velocity", 0.0),
-            data.get("sentiment_score", 50.0),
-            1 if data.get("has_viral_tweet") else 0,
-            data.get("social_score", 0.0),
-        ),
-    )
-    await db.commit()
-    logger.debug(f"Saved social_signals for token {data['token_address']}")
+    try:
+        db = await _get_db()
+        await db.execute(
+            """
+            INSERT INTO social_signals (
+                token_address, mention_count_1h, mention_velocity,
+                sentiment_score, has_viral_tweet, social_score
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["token_address"],
+                data.get("mention_count_1h", 0),
+                data.get("mention_velocity", 0.0),
+                data.get("sentiment_score", 50.0),
+                1 if data.get("has_viral_tweet") else 0,
+                data.get("social_score", 0.0),
+            ),
+        )
+        await db.commit()
+        logger.debug(f"Saved social_signals for token {data['token_address']}")
+    except Exception as exc:
+        logger.error(f"Error saving social_signals: {exc}")
 
 
 async def save_rug_analysis(data: Dict[str, Any]) -> None:
@@ -290,25 +304,28 @@ async def save_rug_analysis(data: Dict[str, Any]) -> None:
 
     risk_flags is stored as a JSON-encoded list of strings.
     """
-    db = await _get_db()
-    risk_flags_json = json.dumps(data.get("risk_flags", []))
-    await db.execute(
-        """
-        INSERT INTO rug_analyses (
-            token_address, rug_probability, pattern_score,
-            risk_flags, recommendation
-        ) VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            data["token_address"],
-            data.get("rug_probability", 0.0),
-            data.get("pattern_score", 100.0),
-            risk_flags_json,
-            data.get("recommendation", "SAFE"),
-        ),
-    )
-    await db.commit()
-    logger.debug(f"Saved rug_analysis for token {data['token_address']}")
+    try:
+        db = await _get_db()
+        risk_flags_json = json.dumps(data.get("risk_flags", []))
+        await db.execute(
+            """
+            INSERT INTO rug_analyses (
+                token_address, rug_probability, pattern_score,
+                risk_flags, recommendation
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                data["token_address"],
+                data.get("rug_probability", 0.0),
+                data.get("pattern_score", 100.0),
+                risk_flags_json,
+                data.get("recommendation", "SAFE"),
+            ),
+        )
+        await db.commit()
+        logger.debug(f"Saved rug_analysis for token {data['token_address']}")
+    except Exception as exc:
+        logger.error(f"Error saving rug_analysis: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -317,49 +334,55 @@ async def save_rug_analysis(data: Dict[str, Any]) -> None:
 
 async def save_detected_pool(data: Dict[str, Any]) -> None:
     """Persist a DetectedPool record to the detected_pools table."""
-    db = await _get_db()
-    await db.execute(
-        """
-        INSERT INTO detected_pools (
-            mint_address, dex_name, signature, block_time, latency_ms
-        ) VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            data["mint_address"],
-            data.get("dex_name", "Unknown"),
-            data.get("signature", ""),
-            data.get("block_time", 0),
-            data.get("latency_ms", 0.0),
-        ),
-    )
-    await db.commit()
-    logger.debug(
-        f"Saved detected_pool: mint={data['mint_address'][:12]}... "
-        f"dex={data.get('dex_name')} latency={data.get('latency_ms', 0):.0f}ms"
-    )
+    try:
+        db = await _get_db()
+        await db.execute(
+            """
+            INSERT INTO detected_pools (
+                mint_address, dex_name, signature, block_time, latency_ms
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                data["mint_address"],
+                data.get("dex_name", "Unknown"),
+                data.get("signature", ""),
+                data.get("block_time", 0),
+                data.get("latency_ms", 0.0),
+            ),
+        )
+        await db.commit()
+        logger.debug(
+            f"Saved detected_pool: mint={data['mint_address'][:12]}... "
+            f"dex={data.get('dex_name')} latency={data.get('latency_ms', 0):.0f}ms"
+        )
+    except Exception as exc:
+        logger.error(f"Error saving detected_pool: {exc}")
 
 
 async def save_holder_velocity_snapshot(data: Dict[str, Any]) -> None:
     """Persist a HolderVelocityResult snapshot to holder_velocity_snapshots."""
-    db = await _get_db()
-    await db.execute(
-        """
-        INSERT INTO holder_velocity_snapshots (
-            token_address, holder_count, holders_per_minute,
-            velocity_label, is_rug_warning, holder_velocity_score
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["token_address"],
-            data.get("holder_count", 0),
-            data.get("holders_per_minute", 0.0),
-            data.get("velocity_label", "STAGNANT"),
-            1 if data.get("is_rug_warning") else 0,
-            data.get("holder_velocity_score", 0.0),
-        ),
-    )
-    await db.commit()
-    logger.debug(f"Saved holder_velocity_snapshot for token {data['token_address']}")
+    try:
+        db = await _get_db()
+        await db.execute(
+            """
+            INSERT INTO holder_velocity_snapshots (
+                token_address, holder_count, holders_per_minute,
+                velocity_label, is_rug_warning, holder_velocity_score
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["token_address"],
+                data.get("holder_count", 0),
+                data.get("holders_per_minute", 0.0),
+                data.get("velocity_label", "STAGNANT"),
+                1 if data.get("is_rug_warning") else 0,
+                data.get("holder_velocity_score", 0.0),
+            ),
+        )
+        await db.commit()
+        logger.debug(f"Saved holder_velocity_snapshot for token {data['token_address']}")
+    except Exception as exc:
+        logger.error(f"Error saving holder_velocity_snapshot: {exc}")
 
 
 async def save_first_buyer_analysis(data: Dict[str, Any]) -> None:
@@ -367,27 +390,30 @@ async def save_first_buyer_analysis(data: Dict[str, Any]) -> None:
 
     ``first_buyers`` is JSON-encoded.
     """
-    db = await _get_db()
-    first_buyers_json = json.dumps(data.get("first_buyers", []))
-    await db.execute(
-        """
-        INSERT INTO first_buyer_analyses (
-            token_address, first_buyers, smart_money_count,
-            smart_money_pct, smart_money_score, analyzed_wallets, data_source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["token_address"],
-            first_buyers_json,
-            data.get("smart_money_count", 0),
-            data.get("smart_money_pct", 0.0),
-            data.get("smart_money_score", 0.0),
-            data.get("analyzed_wallets", 0),
-            data.get("data_source", "rpc"),
-        ),
-    )
-    await db.commit()
-    logger.debug(f"Saved first_buyer_analysis for token {data['token_address']}")
+    try:
+        db = await _get_db()
+        first_buyers_json = json.dumps(data.get("first_buyers", []))
+        await db.execute(
+            """
+            INSERT INTO first_buyer_analyses (
+                token_address, first_buyers, smart_money_count,
+                smart_money_pct, smart_money_score, analyzed_wallets, data_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["token_address"],
+                first_buyers_json,
+                data.get("smart_money_count", 0),
+                data.get("smart_money_pct", 0.0),
+                data.get("smart_money_score", 0.0),
+                data.get("analyzed_wallets", 0),
+                data.get("data_source", "rpc"),
+            ),
+        )
+        await db.commit()
+        logger.debug(f"Saved first_buyer_analysis for token {data['token_address']}")
+    except Exception as exc:
+        logger.error(f"Error saving first_buyer_analysis: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -396,74 +422,83 @@ async def save_first_buyer_analysis(data: Dict[str, Any]) -> None:
 
 async def save_tx_pattern(data: Dict[str, Any]) -> None:
     """Persist a TxPatternResult to tx_pattern_results."""
-    db = await _get_db()
-    await db.execute(
-        """
-        INSERT INTO tx_pattern_results (
-            token_address, buy_count, sell_count, total_txs,
-            buy_ratio, wash_trade_count, is_artificial_pump, tx_pattern_score
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["token_address"],
-            data.get("buy_count",           0),
-            data.get("sell_count",          0),
-            data.get("total_txs",           0),
-            data.get("buy_ratio",           0.5),
-            data.get("wash_trade_count",    0),
-            1 if data.get("is_artificial_pump") else 0,
-            data.get("tx_pattern_score",    50.0),
-        ),
-    )
-    await db.commit()
-    logger.debug(f"Saved tx_pattern for token {data['token_address']}")
+    try:
+        db = await _get_db()
+        await db.execute(
+            """
+            INSERT INTO tx_pattern_results (
+                token_address, buy_count, sell_count, total_txs,
+                buy_ratio, wash_trade_count, is_artificial_pump, tx_pattern_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["token_address"],
+                data.get("buy_count",           0),
+                data.get("sell_count",          0),
+                data.get("total_txs",           0),
+                data.get("buy_ratio",           0.5),
+                data.get("wash_trade_count",    0),
+                1 if data.get("is_artificial_pump") else 0,
+                data.get("tx_pattern_score",    50.0),
+            ),
+        )
+        await db.commit()
+        logger.debug(f"Saved tx_pattern for token {data['token_address']}")
+    except Exception as exc:
+        logger.error(f"Error saving tx_pattern: {exc}")
 
 
 async def save_liquidity_growth(data: Dict[str, Any]) -> None:
     """Persist a LiquidityGrowthResult to liquidity_growth_results."""
-    db = await _get_db()
-    await db.execute(
-        """
-        INSERT INTO liquidity_growth_results (
-            token_address, candle_count, total_volume, first_candle_vol_pct,
-            volume_cv, growth_pattern, growth_rate_pct, liquidity_growth_score
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["token_address"],
-            data.get("candle_count",            0),
-            data.get("total_volume",            0.0),
-            data.get("first_candle_vol_pct",    0.0),
-            data.get("volume_cv",               0.0),
-            data.get("growth_pattern",          "INSUFFICIENT_DATA"),
-            data.get("growth_rate_pct",         0.0),
-            data.get("liquidity_growth_score",  50.0),
-        ),
-    )
-    await db.commit()
-    logger.debug(f"Saved liquidity_growth for token {data['token_address']}")
+    try:
+        db = await _get_db()
+        await db.execute(
+            """
+            INSERT INTO liquidity_growth_results (
+                token_address, candle_count, total_volume, first_candle_vol_pct,
+                volume_cv, growth_pattern, growth_rate_pct, liquidity_growth_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["token_address"],
+                data.get("candle_count",            0),
+                data.get("total_volume",            0.0),
+                data.get("first_candle_vol_pct",    0.0),
+                data.get("volume_cv",               0.0),
+                data.get("growth_pattern",          "INSUFFICIENT_DATA"),
+                data.get("growth_rate_pct",         0.0),
+                data.get("liquidity_growth_score",  50.0),
+            ),
+        )
+        await db.commit()
+        logger.debug(f"Saved liquidity_growth for token {data['token_address']}")
+    except Exception as exc:
+        logger.error(f"Error saving liquidity_growth: {exc}")
 
 
 async def save_cross_dex_result(data: Dict[str, Any]) -> None:
     """Persist a CrossDexResult to cross_dex_results. Prices dict is JSON-encoded."""
-    db = await _get_db()
-    prices_json = json.dumps(data.get("prices", {}))
-    await db.execute(
-        """
-        INSERT INTO cross_dex_results (
-            token_address, source_count, price_gap_pct,
-            gap_label, is_manipulated, cross_dex_score, prices_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["token_address"],
-            data.get("source_count",    0),
-            data.get("price_gap_pct",   0.0),
-            data.get("gap_label",       "UNKNOWN"),
-            1 if data.get("is_manipulated") else 0,
-            data.get("cross_dex_score", 50.0),
-            prices_json,
-        ),
-    )
-    await db.commit()
-    logger.debug(f"Saved cross_dex_result for token {data['token_address']}")
+    try:
+        db = await _get_db()
+        prices_json = json.dumps(data.get("prices", {}))
+        await db.execute(
+            """
+            INSERT INTO cross_dex_results (
+                token_address, source_count, price_gap_pct,
+                gap_label, is_manipulated, cross_dex_score, prices_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["token_address"],
+                data.get("source_count",    0),
+                data.get("price_gap_pct",   0.0),
+                data.get("gap_label",       "UNKNOWN"),
+                1 if data.get("is_manipulated") else 0,
+                data.get("cross_dex_score", 50.0),
+                prices_json,
+            ),
+        )
+        await db.commit()
+        logger.debug(f"Saved cross_dex_result for token {data['token_address']}")
+    except Exception as exc:
+        logger.error(f"Error saving cross_dex_result: {exc}")

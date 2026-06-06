@@ -21,17 +21,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import struct
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple
 
-import aiohttp
+import httpx
 from loguru import logger
 from solders.keypair import Keypair  # type: ignore
 from solders.transaction import VersionedTransaction  # type: ignore
 
-from config.settings import settings
+from config.settings import settings, runtime_state
+from core.shared_state import shared_state
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -128,7 +128,7 @@ class SwapEngine:
 
     def __init__(self) -> None:
         self._keypair: Optional[Keypair] = None
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: Optional[httpx.AsyncClient] = None
 
         # Idempotency
         self._active_trades: Set[str]                   = set()
@@ -167,8 +167,8 @@ class SwapEngine:
 
     async def start(self) -> None:
         """Open HTTP session and load keypair from settings."""
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10),
+        self._session = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0),
             headers={"Content-Type": "application/json"},
         )
         self._keypair = self._load_keypair()
@@ -178,7 +178,7 @@ class SwapEngine:
         for task in self._monitor_tasks.values():
             task.cancel()
         if self._session:
-            await self._session.close()
+            await self._session.aclose()
         logger.info("SwapEngine stopped.")
 
     # ── keypair ────────────────────────────────────────────────────────────
@@ -241,12 +241,12 @@ class SwapEngine:
         for attempt in range(MAX_RETRIES):
             try:
                 t0 = time.monotonic()
-                async with self._session.post(self._rpc_url, json=payload) as resp:
-                    latency_ms = (time.monotonic() - t0) * 1000
-                    if self._circuit_breaker:
-                        await self._circuit_breaker.on_rpc_latency(latency_ms)
-                    data = await resp.json(content_type=None)
-                    return data.get("result")
+                resp = await self._session.post(self._rpc_url, json=payload)
+                latency_ms = (time.monotonic() - t0) * 1000
+                if self._circuit_breaker:
+                    await self._circuit_breaker.on_rpc_latency(latency_ms)
+                data = resp.json()
+                return data.get("result")
             except Exception as exc:
                 logger.warning(
                     f"RPC call {method} attempt {attempt+1} failed: {exc}"
@@ -327,7 +327,7 @@ class SwapEngine:
         position = balance * quarter_kelly
 
         position = max(position, settings.MIN_POSITION_SIZE_SOL)
-        position = min(position, settings.MAX_POSITION_SIZE_SOL)
+        position = min(position, runtime_state.max_position_size_sol)
         return round(position, 4)
 
     # ── Jupiter API helpers ────────────────────────────────────────────────
@@ -350,15 +350,15 @@ class SwapEngine:
         }
         for attempt in range(MAX_RETRIES):
             try:
-                async with self._session.get(
+                resp = await self._session.get(
                     JUP_QUOTE_URL, params=params
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.json(content_type=None)
-                    body = await resp.text()
-                    logger.warning(
-                        f"Jupiter quote HTTP {resp.status}: {body[:200]}"
-                    )
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                body = resp.text
+                logger.warning(
+                    f"Jupiter quote HTTP {resp.status_code}: {body[:200]}"
+                )
             except Exception as exc:
                 logger.warning(f"Jupiter quote attempt {attempt+1}: {exc}")
             if attempt < MAX_RETRIES - 1:
@@ -385,32 +385,32 @@ class SwapEngine:
 
         for attempt in range(MAX_RETRIES):
             try:
-                async with self._session.post(
+                resp = await self._session.post(
                     JUP_SWAP_URL, json=payload
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.warning(
-                            f"Jupiter swap HTTP {resp.status}: {body[:200]}"
-                        )
-                        if attempt < MAX_RETRIES - 1:
-                            await asyncio.sleep(RETRY_BACKOFF[attempt])
-                        continue
-                    data = await resp.json(content_type=None)
-                    tx_b64 = data.get("swapTransaction")
-                    if not tx_b64:
-                        logger.error("Jupiter swap: missing swapTransaction field")
-                        return None
+                )
+                if resp.status_code != 200:
+                    body = resp.text
+                    logger.warning(
+                        f"Jupiter swap HTTP {resp.status_code}: {body[:200]}"
+                    )
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_BACKOFF[attempt])
+                    continue
+                data = resp.json()
+                tx_b64 = data.get("swapTransaction")
+                if not tx_b64:
+                    logger.error("Jupiter swap: missing swapTransaction field")
+                    return None
 
-                    # Sign the transaction
-                    tx_bytes = base64.b64decode(tx_b64)
-                    tx       = VersionedTransaction.from_bytes(tx_bytes)
-                    signed   = self._keypair.sign_versioned_transaction(tx)
-                    signed_b64 = base64.b64encode(bytes(signed)).decode()
+                # Sign the transaction
+                tx_bytes = base64.b64decode(tx_b64)
+                tx       = VersionedTransaction.from_bytes(tx_bytes)
+                signed   = self._keypair.sign_versioned_transaction(tx)
+                signed_b64 = base64.b64encode(bytes(signed)).decode()
 
-                    # Send via RPC
-                    sig = await self._send_raw_transaction(signed_b64)
-                    return sig
+                # Send via RPC
+                sig = await self._send_raw_transaction(signed_b64)
+                return sig
             except Exception as exc:
                 logger.error(f"Jupiter swap attempt {attempt+1}: {exc}")
                 if attempt < MAX_RETRIES - 1:
@@ -436,39 +436,39 @@ class SwapEngine:
         # Primary: DexScreener
         try:
             url = DEXSCREENER_URL.format(mint=mint)
-            async with self._session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    pairs = data.get("pairs") or []
-                    if pairs:
-                        p = pairs[0]
-                        price_usd = float(p.get("priceUsd") or 0)
-                        liq_usd   = float(
-                            (p.get("liquidity") or {}).get("usd") or 0
-                        )
-                        return PriceData(
-                            price_usd=price_usd,
-                            liquidity_usd=liq_usd,
-                            source="dexscreener",
-                        )
+            resp = await self._session.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                pairs = data.get("pairs") or []
+                if pairs:
+                    p = pairs[0]
+                    price_usd = float(p.get("priceUsd") or 0)
+                    liq_usd   = float(
+                        (p.get("liquidity") or {}).get("usd") or 0
+                    )
+                    return PriceData(
+                        price_usd=price_usd,
+                        liquidity_usd=liq_usd,
+                        source="dexscreener",
+                    )
         except Exception as exc:
             logger.debug(f"DexScreener price fetch failed for {mint}: {exc}")
 
         # Backup: GeckoTerminal (uses pool address — first attempt with mint)
         try:
             url = GECKO_URL.format(address=mint)
-            async with self._session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    attrs = (data.get("data") or {}).get("attributes") or {}
-                    price = float(attrs.get("base_token_price_usd") or 0)
-                    liq   = float(attrs.get("reserve_in_usd") or 0)
-                    if price > 0:
-                        return PriceData(
-                            price_usd=price,
-                            liquidity_usd=liq,
-                            source="geckoterminal",
-                        )
+            resp = await self._session.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                attrs = (data.get("data") or {}).get("attributes") or {}
+                price = float(attrs.get("base_token_price_usd") or 0)
+                liq   = float(attrs.get("reserve_in_usd") or 0)
+                if price > 0:
+                    return PriceData(
+                        price_usd=price,
+                        liquidity_usd=liq,
+                        source="geckoterminal",
+                    )
         except Exception as exc:
             logger.debug(f"GeckoTerminal price fetch failed for {mint}: {exc}")
 
@@ -516,11 +516,11 @@ class SwapEngine:
 
         async with mint_lock:
             # ── 2. Safety checks ─────────────────────────────────────────
-            if not settings.ENABLE_AUTO_BUY:
+            if not shared_state.autobuy_enabled:
                 return BuyResult(
                     success=False, mint_address=mint_address, symbol=symbol,
                     entry_price=0, entry_sol=0, tokens_received=0,
-                    tx_signature=None, error="ENABLE_AUTO_BUY is False",
+                    tx_signature=None, error="Auto-buy disabled",
                     signal_score=signal_score,
                 )
 
@@ -612,7 +612,9 @@ class SwapEngine:
                         error="Transaction send failed", signal_score=signal_score,
                     )
 
-                token_decimals = await self._get_token_decimals(mint_address)
+                token_decimals = int(quote.get("outputDecimals", 0))
+                if token_decimals == 0:
+                    token_decimals = await self._get_token_decimals(mint_address)
                 tokens_received = out_amount / (10 ** token_decimals)
 
                 result = BuyResult(
@@ -686,12 +688,12 @@ class SwapEngine:
         """
         Sell *token_amount* tokens back to SOL via Jupiter v6.
         """
-        if not settings.ENABLE_AUTO_SELL:
+        if not shared_state.autosell_enabled:
             return SellResult(
                 success=False, mint_address=mint_address,
                 exit_price=0, exit_sol=0,
                 exit_reason=exit_reason, tx_signature=None,
-                error="ENABLE_AUTO_SELL is False",
+                error="Auto-sell disabled",
             )
 
         if not self._keypair:

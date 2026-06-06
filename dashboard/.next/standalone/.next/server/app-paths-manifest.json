@@ -1,8 +1,0 @@
-{
-  "/_not-found/page": "app/_not-found/page.js",
-  "/settings/page": "app/settings/page.js",
-  "/backtest/page": "app/backtest/page.js",
-  "/signals/page": "app/signals/page.js",
-  "/page": "app/page.js",
-  "/trades/page": "app/trades/page.js"
-}

@@ -68,6 +68,7 @@ class TxPatternResult:
     wash_trade_count:   int   = 0
     is_artificial_pump: bool  = False
     tx_pattern_score:   float = 50.0  # neutral default
+    buy_sell_ratio:     float = 1.0   # F1: buy_count / max(sell_count, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +303,7 @@ class TxPatternScorer:
                 f"buys={buy_count}/{total} ({buy_ratio:.0%}), "
                 f"wash={len(wash_wallets)}, score={score:.1f}"
             )
+            bsr = buy_count / max(sell_count, 1)
             return TxPatternResult(
                 token_address=token_address,
                 buy_count=buy_count,
@@ -312,6 +314,7 @@ class TxPatternScorer:
                 wash_trade_count=len(wash_wallets),
                 is_artificial_pump=is_artificial,
                 tx_pattern_score=score,
+                buy_sell_ratio=round(bsr, 4),
             )
 
         except Exception as exc:

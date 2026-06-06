@@ -2,12 +2,9 @@
 
 import { useState, useEffect } from 'react'
 
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || 'change-me-in-production'
-
 async function apiFetch(path: string) {
-  const res = await fetch(`${API}${path}`, {
-    headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' },
+  const res = await fetch(`/api/proxy/api${path}`, {
+    headers: { 'Content-Type': 'application/json' },
   })
   if (!res.ok) throw new Error(`API ${res.status}`)
   return res.json()
@@ -20,7 +17,7 @@ export function usePortfolio() {
   const fetchPortfolio = async () => {
     try {
       setLoading(true)
-      const data = await apiFetch('/api/portfolio')
+      const data = await apiFetch('/portfolio')
       setPortfolio(data)
     } catch (e) {
       console.error('Portfolio fetch error:', e)
@@ -39,7 +36,7 @@ export function useSignals(limit = 50) {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    apiFetch(`/api/signals?limit=${limit}`).then(d => { setSignals(d.signals || []); setLoading(false) }).catch(() => setLoading(false))
+    apiFetch(`/signals?limit=${limit}`).then(d => { setSignals(d.signals || []); setLoading(false) }).catch(() => setLoading(false))
   }, [limit])
 
   return { signals, loading }
@@ -50,7 +47,7 @@ export function useTrades(limit = 100) {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    apiFetch(`/api/trades?limit=${limit}`).then(d => { setTrades(d.trades || []); setLoading(false) }).catch(() => setLoading(false))
+    apiFetch(`/trades?limit=${limit}`).then(d => { setTrades(d.trades || []); setLoading(false) }).catch(() => setLoading(false))
   }, [limit])
 
   return { trades, loading }
@@ -62,7 +59,7 @@ export function useBotStatus() {
 
   const fetchStatus = async () => {
     try {
-      const data = await apiFetch('/api/status')
+      const data = await apiFetch('/status')
       setStatus(data)
     } catch (e) {
       console.error('Status fetch error:', e)
@@ -81,21 +78,19 @@ export function useStats() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    apiFetch('/api/stats').then(d => { setStats(d); setLoading(false) }).catch(() => setLoading(false))
+    apiFetch('/stats').then(d => { setStats(d); setLoading(false) }).catch(() => setLoading(false))
   }, [])
 
   return { stats, loading }
 }
 
 export async function apiControl(action: string, value?: any) {
-  return apiFetch('/api/control')
-    .catch(() => {
-      return fetch(`${API}/api/control`, {
-        method: 'POST',
-        headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, value }),
-      }).then(r => r.json())
-    })
+  const res = await fetch('/api/proxy/api/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, value }),
+  })
+  return res.json()
 }
 
 export async function apiGet(path: string) {

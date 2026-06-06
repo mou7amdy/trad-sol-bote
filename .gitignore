@@ -8,3 +8,7 @@ archive/
 *.db
 *.sqlite
 dashboard/node_modules/
+.DS_Store
+dashboard/.next/
+*.pdf
+.venv/

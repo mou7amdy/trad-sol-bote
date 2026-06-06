@@ -315,13 +315,14 @@ def build_report():
         ("I5", "core/speed_optimizer.py",
          "parallel_scan timeout applies uniformly to all tasks",
          "The 8-second MAX_PROCESSING_TIME applies to the whole asyncio.gather. A slow external API "
-         "(e.g. Birdeye, GoPlus) can timeout fast tasks like local analysis.",
+         "(e.g. GeckoTerminal, GoPlus) can timeout fast tasks like local analysis.",
          "Consider per-task timeouts for independent operations so one slow API doesn't starve others."),
-        ("I6", "core/token_analyzer.py:36-42",
-         "Mock fallback returns random data silently",
-         "When BIRDEYE_API_KEY is unset, get_ohlcv silently returns random mock data with a fake "
-         "volume spike. No warning logged.",
-         "Operator may not realize they are running on fake data. Add logger.warning when mock is used."),
+        ("I6", "RESOLVED — Birdeye removed",
+         "Birdeye API removed entirely; replaced with GeckoTerminal + DexScreener (both free, no key)",
+         "Birdeye was an API-key-gated paid service that caused 25 bugs and failed gracefully into "
+         "silent mock data. It has been replaced with 100% free alternatives: GeckoTerminal for OHLCV, "
+         "DexScreener for price/liquidity/volume/txns data. No API keys required, no mock data path.",
+         "Fixed by replacing all Birdeye endpoints with free alternatives and removing the mock fallback."),
         ("I7", "bot/tg_bot.py:937",
          "dp.start_polling(bot) never awaits detector_coro in live mode",
          "In live mode (bot is not None), detector_coro is launched as create_task() and "

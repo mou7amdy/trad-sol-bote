@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from api.event_bus import event_bus
-from config.settings import settings
+from config.settings import settings, runtime_state
 from database.sqlite_client import _get_db, get_recent_signals
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ app = FastAPI(title="Solana Bot Dashboard API", version="1.0.0", lifespan=lifesp
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://localhost:3000"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -77,8 +77,8 @@ async def get_status(_=Depends(verify_api_key)):
 
     return {
         "bot_running": True,
-        "auto_buy_enabled": settings.ENABLE_AUTO_BUY,
-        "auto_sell_enabled": settings.ENABLE_AUTO_SELL,
+        "auto_buy_enabled": shared_state.autobuy_enabled,
+        "auto_sell_enabled": shared_state.autosell_enabled,
         "circuit_breaker_active": cb.is_active(),
         "circuit_breaker_level": cb.level.value,
         "uptime_seconds": int(time.time() - _start_time),
@@ -260,30 +260,31 @@ async def control_bot(body: dict[str, Any], _=Depends(verify_api_key)):
 
     from trading.circuit_breaker import circuit_breaker
     from trading.swap_engine import swap_engine
+    from core.shared_state import shared_state
 
     if action == "enable_autobuy":
-        settings.ENABLE_AUTO_BUY = True
+        shared_state.autobuy_enabled = True
         return {"success": True, "message": "Auto-buy enabled"}
     elif action == "disable_autobuy":
-        settings.ENABLE_AUTO_BUY = False
+        shared_state.autobuy_enabled = False
         return {"success": True, "message": "Auto-buy disabled"}
     elif action == "enable_autosell":
-        settings.ENABLE_AUTO_SELL = True
+        shared_state.autosell_enabled = True
         return {"success": True, "message": "Auto-sell enabled"}
     elif action == "disable_autosell":
-        settings.ENABLE_AUTO_SELL = False
+        shared_state.autosell_enabled = False
         return {"success": True, "message": "Auto-sell disabled"}
     elif action == "set_position_size":
         val = float(value or 0.1)
-        settings.MAX_POSITION_SIZE_SOL = max(0.01, min(1.0, val))
-        return {"success": True, "message": f"Position size set to {settings.MAX_POSITION_SIZE_SOL} SOL"}
+        runtime_state.max_position_size_sol = max(0.01, min(1.0, val))
+        return {"success": True, "message": f"Position size set to {runtime_state.max_position_size_sol} SOL"}
     elif action == "set_min_score":
         val = float(value or 0.5)
-        settings.MIN_SIGNAL_SCORE_FOR_BUY = max(0.1, min(1.0, val))
-        return {"success": True, "message": f"Min score set to {settings.MIN_SIGNAL_SCORE_FOR_BUY}"}
+        runtime_state.min_signal_score_for_buy = max(10.0, min(100.0, val * 100.0))
+        return {"success": True, "message": f"Min score set to {runtime_state.min_signal_score_for_buy}"}
     elif action == "emergency_stop_all":
-        settings.ENABLE_AUTO_BUY = False
-        settings.ENABLE_AUTO_SELL = False
+        shared_state.autobuy_enabled = False
+        shared_state.autosell_enabled = False
         await circuit_breaker.manual_pause(reason="Emergency stop from dashboard")
         return {"success": True, "message": "Emergency stop activated"}
     elif action == "resume":

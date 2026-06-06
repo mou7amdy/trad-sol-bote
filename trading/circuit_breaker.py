@@ -24,7 +24,7 @@ from typing import Callable, Coroutine, List, Optional, Any
 import aiosqlite
 from loguru import logger
 
-from config.settings import settings
+from config.settings import settings, runtime_state
 
 # ---------------------------------------------------------------------------
 # Enums + state dataclass
@@ -318,7 +318,7 @@ class CircuitBreaker:
                 f"CircuitBreaker: {rug_rate_pct:.0f}% rug rate on last 10 tokens. "
                 f"Raising MIN_SIGNAL_SCORE_FOR_BUY to 0.85."
             )
-            self._runtime_min_score = 0.85
+            runtime_state.min_signal_score_for_buy = 85.0
             await self._send_alert(
                 f"⚠️ *Circuit Breaker: High Rug Rate*\n"
                 f"Last 10 tokens: {rug_rate_pct:.0f}% rugs.\n"
@@ -338,8 +338,8 @@ class CircuitBreaker:
                     f"CircuitBreaker: SOL dropped {drop_pct:.1f}% in 1h. "
                     f"Halving MAX_POSITION_SIZE_SOL."
                 )
-                current_max = self._runtime_max_position or settings.MAX_POSITION_SIZE_SOL
-                self._runtime_max_position = current_max / 2.0
+                current_max = runtime_state.max_position_size_sol
+                runtime_state.max_position_size_sol = max(0.01, current_max / 2.0)
                 await self._send_alert(
                     f"⚠️ *Circuit Breaker: SOL Price Drop*\n"
                     f"SOL fell {drop_pct:.1f}% in 1 hour.\n"

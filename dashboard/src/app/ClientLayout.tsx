@@ -43,28 +43,39 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
   }, [])
 
   useEffect(() => {
-    const apiKey = process.env.NEXT_PUBLIC_API_KEY || 'change-me-in-production'
-    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws'
+    let cancelled = false
     let socket: WebSocket | null = null
     let reconnectTimer: any
 
-    const connect = () => {
-      socket = new WebSocket(`${wsUrl}?api_key=${apiKey}`)
-      socket.onopen = () => setWsConnected(true)
-      socket.onclose = () => {
-        setWsConnected(false)
-        reconnectTimer = setTimeout(connect, 3000)
+    const connect = async () => {
+      try {
+        const resp = await fetch('/api/config')
+        const config = await resp.json()
+        if (cancelled) return
+
+        const apiKey = config.apiKey
+        const wsUrl = config.wsUrl
+
+        socket = new WebSocket(`${wsUrl}?api_key=${apiKey}`)
+        socket.onopen = () => setWsConnected(true)
+        socket.onclose = () => {
+          setWsConnected(false)
+          if (!cancelled) reconnectTimer = setTimeout(connect, 3000)
+        }
+        socket.onmessage = (e) => {
+          try {
+            const msg = JSON.parse(e.data)
+            if (msg.type === 'alert') addAlert(msg.data.text || msg.data.message, 'warning')
+          } catch {}
+        }
+        socket.onerror = () => socket?.close()
+      } catch {
+        if (!cancelled) reconnectTimer = setTimeout(connect, 3000)
       }
-      socket.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data)
-          if (msg.type === 'alert') addAlert(msg.data.text || msg.data.message, 'warning')
-        } catch {}
-      }
-      socket.onerror = () => socket?.close()
     }
     connect()
     return () => {
+      cancelled = true
       socket?.close()
       clearTimeout(reconnectTimer)
     }

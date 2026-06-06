@@ -38,7 +38,7 @@ from loguru import logger
 from security.scanner import SecurityResult
 from core.token_analyzer import AnalysisResult
 from core.solana_scanner import TokenInfo
-from config.settings import settings as _settings
+from config.settings import settings as _settings, runtime_state
 
 # ---------------------------------------------------------------------------
 # Phase 2 scoring weights (must sum to 1.00)
@@ -130,38 +130,20 @@ load_weights_from_optimal_params()
 
 def _get_ml_prediction(
     token_info: Any,
+    analysis_result: Any,
+    security_result: Any,
     wallet_analysis: Any,
-    holder_velocity: Any,
-    social_signals: Any,
 ) -> Optional[Any]:
     """
-    Attempt to get ML probability predictions.  Returns a PredictionResult
+    Attempt to get ML probability predictions.  Returns an MLPrediction
     or None if models aren't loaded / libraries missing.
     """
     try:
-        from backtesting.ml_optimizer import ml_optimizer
-        if ml_optimizer._model_2x is None and ml_optimizer._model_rug is None:
-            return None   # models not trained yet
-        features = {
-            "initial_liquidity_usd": getattr(token_info, "liquidity_usd", 0),
-            "holder_velocity_1min":  getattr(holder_velocity, "holder_velocity_score", 0) / 10.0
-                                     if holder_velocity else 0,
-            "sniper_count":          getattr(wallet_analysis, "sniper_count", 0)
-                                     if wallet_analysis else 0,
-            "buy_sell_ratio_5min":   getattr(token_info, "buy_sell_ratio", 1.0),
-            "top_holder_percent":    getattr(token_info, "top10_holders_pct", 0) / 10.0,
-            "lp_burned":             int(getattr(token_info, "lp_burned", False)),
-            "mint_revoked":          int(getattr(token_info, "mint_revoked", False)),
-            "dev_cluster_detected":  int(getattr(wallet_analysis, "is_dev_cluster", False))
-                                     if wallet_analysis else 0,
-            "wash_trading_score":    0.0,
-            "telegram_mentions":     getattr(social_signals, "telegram_mentions", 0)
-                                     if social_signals else 0,
-            "token_age_seconds":     0,
-            "dex_buy_volume_5min":   getattr(token_info, "volume_5m", 0),
-            "price_change_1min":     0.0,
-        }
-        return ml_optimizer.predict(features)
+        from backtesting.ml_optimizer import MLOptimizer
+        opt = MLOptimizer()
+        if not opt.load_models():
+            return None
+        return opt.predict(token_info, analysis_result, security_result, wallet_analysis)
     except Exception:
         return None  # silently degrade if backtesting module missing
 
@@ -175,12 +157,14 @@ class SignalDecision:
         composite_score: float = 0.0,
         buy_recommended: bool = False,
         recommended_position_sol: float = 0.0,
+        ml_pred: Optional[Any] = None,
     ) -> None:
         self.send                    = send
         self.reason                  = reason
         self.composite_score         = composite_score   # 0–100 weighted aggregate
         self.buy_recommended         = buy_recommended   # True when score ≥ MIN_SIGNAL_SCORE_FOR_BUY
         self.recommended_position_sol = recommended_position_sol  # fractional Kelly hint
+        self.ml_pred                 = ml_pred
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +260,35 @@ def evaluate_signal(
             f"(buy_ratio={tx_pattern.buy_ratio:.0%}, wash={tx_pattern.wash_trade_count})"
         )
 
-    # ── ⑫ Composite SIGNAL_SCORE ──────────────────────────────────────
+    # ── ⑫ ML prediction (Part 4) ─────────────────────────────────────
+    ml_pred: Optional[Any] = None
+    try:
+        from backtesting.ml_optimizer import MLOptimizer
+        _ml_opt = MLOptimizer()
+        if _ml_opt.load_models():
+            ml_pred = _ml_opt.predict(token_info, analysis_res, security_res, wallet_analysis)
+    except Exception:
+        pass
+
+    ml_gates_active = ml_pred is not None and hasattr(ml_pred, 'should_signal')
+
+    if ml_gates_active:
+        # Replace confidence gate with ML pump probability
+        if ml_pred.pump_probability < 0.55:
+            fail_reasons.append(
+                f"ML pump probability too low ({ml_pred.pump_probability:.0%})"
+            )
+        # Replace rug gate with ML rug probability
+        if ml_pred.rug_probability > 0.35:
+            fail_reasons.append(
+                f"ML rug probability too high ({ml_pred.rug_probability:.0%})"
+            )
+    else:
+        # ── ⑫–⑬ ML not available — use rule-based gates ──────────────
+        # Rug gate already handled above at ⑦
+        pass
+
+    # ── ⑭ Composite SIGNAL_SCORE ─────────────────────────────────────
     NEUTRAL = 50.0
     sec_score  = security_res.score
     wal_score  = wallet_analysis.wallet_score           if wallet_analysis  else NEUTRAL
@@ -297,6 +309,13 @@ def evaluate_signal(
         + soc_score  * _W_SOCIAL
         + cdx_score  * _W_CROSS_DEX
     )
+
+    if ml_gates_active:
+        ml_score_weight = 0.10
+        weighted_ml = ml_pred.ml_score * ml_score_weight
+        remaining = 1.0 - ml_score_weight
+        composite = composite * remaining + weighted_ml
+
     composite = round(composite, 2)
 
     logger.info(
@@ -304,6 +323,7 @@ def evaluate_signal(
         f"[sec={sec_score:.0f} wal={wal_score:.0f} rug={rug_score:.0f} "
         f"hv={hv_score:.0f} sm={sm_score:.0f} txp={txp_score:.0f} "
         f"soc={soc_score:.0f} cdx={cdx_score:.0f}]"
+        + (f" ml={ml_pred.ml_score:.0f}" if ml_gates_active else "")
     )
 
     if composite < _MIN_COMPOSITE_SCORE and not fail_reasons:
@@ -311,48 +331,18 @@ def evaluate_signal(
             f"Composite signal score too low ({composite:.1f}/100 < {_MIN_COMPOSITE_SCORE})"
         )
 
-    # --- ML prediction injection (Phase 4 — lazy, no-op if models missing) ---
-    ml_pred = _get_ml_prediction(
-        token_info, wallet_analysis, holder_velocity, social_signals
-    )
-    ml_rug_blocked  = False
-    ml_2x_boosted   = False
-    if ml_pred is not None and ml_pred.ml_available:
-        # Block trade if rug probability > 70%
-        if ml_pred.prob_rug > 0.70:
-            fail_reasons.append(
-                f"ML rug probability too high ({ml_pred.prob_rug:.0%})"
-            )
-            ml_rug_blocked = True
-            logger.info(
-                f"ML rug gate triggered for {token_info.address}: "
-                f"prob_rug={ml_pred.prob_rug:.2%}"
-            )
-        # Boost composite score if 2x probability > 60%
-        if ml_pred.prob_2x > 0.60 and not ml_rug_blocked:
-            boost = min(5.0, (ml_pred.prob_2x - 0.60) * 50.0)   # max +5 pts
-            composite = min(100.0, composite + boost)
-            ml_2x_boosted = True
-            logger.info(
-                f"ML 2x boost for {token_info.address}: "
-                f"prob_2x={ml_pred.prob_2x:.2%} +{boost:.1f}pts"
-            )
-
     send   = len(fail_reasons) == 0
     reason = "All checks passed!" if send else "; ".join(fail_reasons)
 
     # --- Auto-buy recommendation ---
-    # Score is 0–100; MIN_SIGNAL_SCORE_FOR_BUY is 0.0–1.0 in settings,
-    # but we express it as a fraction of 100 for comparison.
-    min_score_threshold = _settings.MIN_SIGNAL_SCORE_FOR_BUY * 100.0  \
-        if _settings.MIN_SIGNAL_SCORE_FOR_BUY <= 1.0              \
-        else _settings.MIN_SIGNAL_SCORE_FOR_BUY
+    min_score_threshold = runtime_state.min_signal_score_for_buy
     buy_recommended = send and (composite >= min_score_threshold)
 
     return SignalDecision(
         send=send,
         reason=reason,
         composite_score=composite,
+        ml_pred=ml_pred,
         buy_recommended=buy_recommended,
     )
 
@@ -413,13 +403,13 @@ def format_signal_message(
     liquidity_growth: Optional[Any] = None,
     cross_dex:        Optional[Any] = None,
     composite_score:  float = 0.0,
+    ml_pred:          Optional[Any] = None,
 ) -> str:
     """Build the full Telegram-formatted signal message."""
     mint        = token_info.address
     dex_source  = token_info.dex_source if hasattr(token_info, "dex_source") else "Raydium_AMM"
     latency_ms  = token_info.detection_latency_ms if hasattr(token_info, "detection_latency_ms") else 0.0
     dex_link    = f"https://dexscreener.com/solana/{mint}"
-    birdeye_lnk = f"https://birdeye.so/token/{mint}?chain=solana"
 
     # ── Header ────────────────────────────────────────────────────────
     msg = (
@@ -431,8 +421,18 @@ def format_signal_message(
         f"💵 **Price:** ${token_info.price:,.6f}\n"
         f"💦 **Liquidity:** ${token_info.liquidity_usd:,.2f}\n"
         f"📊 **Market Cap:** ${token_info.market_cap:,.2f}\n"
-        f"🎯 **Signal Score:** `{composite_score:.1f}/100`\n\n"
+        f"🎯 **Signal Score:** `{composite_score:.1f}/100`\n"
     )
+
+    # ── ML Prediction data ────────────────────────────────────────────
+    if ml_pred and hasattr(ml_pred, 'ml_score'):
+        msg += (
+            f"🤖 **ML Score:** `{ml_pred.ml_score:.0f}/100`\n"
+            f"⏱ **Best Entry:** `T+{ml_pred.entry_minutes}min`\n"
+            f"📈 **Pump Prob:** `{ml_pred.pump_probability:.0%}` | "
+            f"🛑 **Rug Prob:** `{ml_pred.rug_probability:.0%}`\n"
+        )
+    msg += "\n"
 
     # ── Security ──────────────────────────────────────────────────────
     msg += (
@@ -559,5 +559,5 @@ def format_signal_message(
             f"  - Social Score: `{social_signals.social_score:.0f}/100`\n"
         )
 
-    msg += f"\n🔗 [DexScreener]({dex_link}) | [Birdeye]({birdeye_lnk})"
+    msg += f"\n🔗 [DexScreener]({dex_link})"
     return msg

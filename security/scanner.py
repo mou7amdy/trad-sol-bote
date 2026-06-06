@@ -11,12 +11,18 @@ class SecurityResult:
         passed: bool,
         fail_reason: str = "",
         scan_status: str = "complete",
+        top10_holders_pct: float = 0.0,
+        lp_burned: bool = False,
+        mint_revoked: bool = False,
     ) -> None:
         self.score = score
         self.passed = passed
         self.fail_reason = fail_reason
         # "complete" | "uncertain" — uncertain means at least one API call failed
         self.scan_status = scan_status
+        self.top10_holders_pct = top10_holders_pct
+        self.lp_burned = lp_burned
+        self.mint_revoked = mint_revoked
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -24,6 +30,9 @@ class SecurityResult:
             "passed": self.passed,
             "fail_reason": self.fail_reason,
             "scan_status": self.scan_status,
+            "top10_holders_pct": self.top10_holders_pct,
+            "lp_burned": self.lp_burned,
+            "mint_revoked": self.mint_revoked,
         }
 
 
@@ -103,55 +112,6 @@ async def check_goplus(token_address: str) -> Dict[str, Any]:
     return {}
 
 
-async def check_liquidity_lock(token_address: str) -> Tuple[bool, float]:
-    """
-    Check if the token's liquidity is locked via Birdeye API.
-
-    Returns: (locked, lock_duration_days)
-    Defaults to (False, 0.0) on any failure or missing API key —
-    never assume locked when the result is unknown.
-    """
-    if not settings.BIRDEYE_API_KEY or settings.BIRDEYE_API_KEY.startswith("your_"):
-        logger.warning(
-            "BIRDEYE_API_KEY is not configured. Liquidity lock check skipped — "
-            "defaulting to unlocked (uncertain)."
-        )
-        return False, 0.0
-
-    url = f"https://public-api.birdeye.so/defi/token_security?address={token_address}"
-    headers: Dict[str, str] = {
-        "x-chain": "solana",
-        "X-API-KEY": settings.BIRDEYE_API_KEY,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                sec_data: Dict[str, Any] = data.get("data", {})
-                locked: bool = bool(
-                    sec_data.get("is_liquidity_locked", False)
-                    or sec_data.get("lp_locked", False)
-                )
-                lock_duration: float = float(
-                    sec_data.get("lp_lock_duration_days", 0.0)
-                )
-                return locked, lock_duration
-            else:
-                logger.warning(
-                    f"Birdeye Security API returned status code {response.status_code} "
-                    f"for {token_address}. Defaulting to unlocked."
-                )
-    except Exception as e:
-        logger.error(
-            f"Error checking liquidity lock for {token_address}: {e}. "
-            "Defaulting to unlocked."
-        )
-
-    return False, 0.0
-
-
 async def full_security_scan(token_address: str) -> SecurityResult:
     """
     Performs full security checks on a token.
@@ -163,7 +123,6 @@ async def full_security_scan(token_address: str) -> SecurityResult:
 
     is_hp, buy_tax, sell_tax = await check_honeypot(token_address)
     goplus_data = await check_goplus(token_address)
-    lp_locked, _lp_lock_duration = await check_liquidity_lock(token_address)
 
     fail_reasons: list[str] = []
     score: float = 100.0
@@ -208,9 +167,16 @@ async def full_security_scan(token_address: str) -> SecurityResult:
         fail_reasons.append("Mint authority not renounced")
         score -= 20
 
-    # 5. Liquidity lock check
-    if not lp_locked:
-        score -= 15
+    # --- F3-F5: Extract from goplus_data ---
+    top10_holders_pct = float(goplus_data.get("top10_holder_rate", goplus_data.get("top10_holders_pct", 0.0)))
+    if 0.0 < top10_holders_pct <= 1.0:
+        top10_holders_pct *= 100.0
+    lp_burned_val = goplus_data.get("lp_burned", False)
+    if isinstance(lp_burned_val, str):
+        lp_burned_val = lp_burned_val.lower() in ("1", "true")
+    mint_revoked_val = goplus_data.get("mint_disabled", False)
+    if isinstance(mint_revoked_val, str):
+        mint_revoked_val = mint_revoked_val.lower() in ("1", "true")
 
     # Final pass/fail — uncertain scans never auto-pass
     final_score: float = max(0.0, score)
@@ -230,4 +196,7 @@ async def full_security_scan(token_address: str) -> SecurityResult:
         passed=passed,
         fail_reason=fail_reason_str,
         scan_status=scan_status,
+        top10_holders_pct=top10_holders_pct,
+        lp_burned=lp_burned_val,
+        mint_revoked=mint_revoked_val,
     )

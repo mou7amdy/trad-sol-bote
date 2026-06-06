@@ -2,8 +2,8 @@
 """
 Phase 2.2 — Liquidity Growth Analyzer
 
-Fetches the first N one-minute OHLCV candles for a newly launched token and
-classifies the liquidity growth pattern as organic or artificial.
+Fetches DexScreener volume data for a newly launched token and classifies
+the liquidity growth pattern as organic or artificial.
 
 Growth patterns
 ---------------
@@ -23,11 +23,9 @@ INSUFFICIENT_DATA — Fewer than 2 candles available (token too new).
 
 Data source
 -----------
-Primary:  Birdeye OHLCV API  (requires BIRDEYE_API_KEY)
-Fallback: DexScreener pairs API (free, no key required)
+DexScreener (free, no API key) — volume data from h1, h6, h24 fields.
 """
 
-import asyncio
 import statistics
 from dataclasses import dataclass, field
 from typing import Optional
@@ -35,12 +33,9 @@ from typing import Optional
 import httpx
 from loguru import logger
 
-from config.settings import settings
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-OHLCV_CANDLES:            int   = 10      # how many 1-minute candles to fetch
 MIN_CANDLES_FOR_ANALYSIS: int   = 2
 SPIKE_THRESHOLD:          float = 0.40    # first candle > 40% of total vol
 DECLINE_THRESHOLD:        float = 0.50    # last candle < 50% of first candle
@@ -80,72 +75,20 @@ class LiquidityGrowthResult:
 
 class LiquidityGrowthAnalyzer:
     """
-    Analyses liquidity/volume growth patterns from OHLCV candle data.
+    Analyses liquidity/volume growth patterns from DexScreener volume data.
 
     All public methods are exception-safe — they always return a valid
     ``LiquidityGrowthResult`` even when every API call fails.
     """
 
-    def __init__(self) -> None:
-        self._birdeye_key = getattr(settings, "BIRDEYE_API_KEY", "")
-
-    def _has_birdeye(self) -> bool:
-        return bool(
-            self._birdeye_key
-            and not self._birdeye_key.startswith("your_")
-        )
-
     # ------------------------------------------------------------------
     # Data fetchers
     # ------------------------------------------------------------------
 
-    async def _fetch_birdeye_ohlcv(self, token_address: str) -> list[LiquidityCandle]:
-        """Fetch 1-minute OHLCV candles from Birdeye."""
-        url = (
-            "https://public-api.birdeye.so/defi/ohlcv"
-            f"?address={token_address}&type=1m&limit={OHLCV_CANDLES}"
-        )
-        headers = {"x-chain": "solana", "X-API-KEY": self._birdeye_key}
-        try:
-            async with httpx.AsyncClient(timeout=7.0) as client:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code == 429:
-                    logger.warning("Birdeye OHLCV rate-limited.")
-                    return []
-                if resp.status_code != 200:
-                    logger.warning(f"Birdeye OHLCV HTTP {resp.status_code}")
-                    return []
-                data = resp.json()
-                items: list[dict] = (
-                    data.get("data", {}).get("items", [])
-                    if isinstance(data.get("data"), dict)
-                    else []
-                )
-                candles = []
-                for item in items:
-                    try:
-                        candles.append(LiquidityCandle(
-                            timestamp=int(item.get("unixTime", 0)),
-                            open=float(item.get("o", 0) or 0),
-                            high=float(item.get("h", 0) or 0),
-                            low=float(item.get("l", 0) or 0),
-                            close=float(item.get("c", 0) or 0),
-                            volume=float(item.get("v", 0) or 0),
-                        ))
-                    except (TypeError, ValueError):
-                        continue
-                logger.debug(f"Birdeye returned {len(candles)} candles for {token_address[:12]}...")
-                return candles
-        except Exception as exc:
-            logger.error(f"_fetch_birdeye_ohlcv error: {exc}")
-        return []
-
-    async def _fetch_dexscreener_ohlcv(self, token_address: str) -> list[LiquidityCandle]:
+    async def _fetch_dexscreener_candles(self, token_address: str) -> list[LiquidityCandle]:
         """
-        Approximate volume history from DexScreener pair data.
-        DexScreener doesn't offer candle-level data on the free API, so we
-        synthesise a single candle from the pair's current liquidity and
-        24h volume for comparison context.
+        Synthetic candles from DexScreener volume fields (h1, h6, h24).
+        Returns up to 3 pseudo-candles for growth analysis.
         """
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
         try:
@@ -153,28 +96,39 @@ class LiquidityGrowthAnalyzer:
                 resp = await client.get(url)
                 if resp.status_code != 200:
                     return []
-                data    = resp.json()
+                data = resp.json()
                 pairs: list[dict] = data.get("pairs") or []
-                # Use the pair with the highest liquidity as the primary
-                pairs = sorted(
-                    [p for p in pairs if p.get("chainId") == "solana"],
-                    key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0),
-                    reverse=True,
-                )
+                pairs = [p for p in pairs if p.get("chainId") == "solana"]
                 if not pairs:
                     return []
-                p   = pairs[0]
-                vol = float((p.get("volume") or {}).get("h1", 0) or 0)
-                price_usd = float(p.get("priceUsd") or 0)
-                if vol > 0 and price_usd > 0:
-                    # Return a pseudo-candle representing the last hour
-                    return [LiquidityCandle(
-                        timestamp=0,
-                        open=price_usd, high=price_usd, low=price_usd,
-                        close=price_usd, volume=vol,
-                    )]
+                best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                volume = best.get("volume", {})
+                price_usd = float(best.get("priceUsd", 0) or 0)
+                vol_h1 = float(volume.get("h1", 0) or 0)
+                vol_h6 = float(volume.get("h6", 0) or 0)
+                vol_h24 = float(volume.get("h24", 0) or 0)
+                if price_usd <= 0:
+                    return []
+                candles = []
+                if vol_h24 > 0:
+                    candles.append(LiquidityCandle(
+                        timestamp=0, open=price_usd, high=price_usd,
+                        low=price_usd, close=price_usd, volume=vol_h24,
+                    ))
+                if vol_h6 > 0:
+                    candles.append(LiquidityCandle(
+                        timestamp=1, open=price_usd, high=price_usd,
+                        low=price_usd, close=price_usd, volume=vol_h6,
+                    ))
+                if vol_h1 > 0:
+                    candles.append(LiquidityCandle(
+                        timestamp=2, open=price_usd, high=price_usd,
+                        low=price_usd, close=price_usd, volume=vol_h1,
+                    ))
+                logger.debug(f"DexScreener returned {len(candles)} synthetic candles for {token_address[:12]}...")
+                return candles
         except Exception as exc:
-            logger.error(f"_fetch_dexscreener_ohlcv error: {exc}")
+            logger.error(f"_fetch_dexscreener_candles error: {exc}")
         return []
 
     # ------------------------------------------------------------------
@@ -202,13 +156,11 @@ class LiquidityGrowthAnalyzer:
             return "DECLINING"
 
         if cv <= CONSISTENCY_CV_MAX:
-            # Low variance — check if overall trend is up
             mid_vol = statistics.median(volumes)
             if last_vol >= mid_vol:
                 return "ORGANIC"
             return "CONSISTENT"
 
-        # High variance but no initial spike → organic volatility
         if last_vol > first_vol:
             return "ORGANIC"
         return "FLATLINE"
@@ -226,13 +178,10 @@ class LiquidityGrowthAnalyzer:
         }
         score = base_scores.get(pattern, 50.0)
 
-        # Fine-tune for ARTIFICIAL_SPIKE severity
         if pattern == "ARTIFICIAL_SPIKE":
-            # The more concentrated the first candle, the worse it is
             excess = (first_vol_pct - SPIKE_THRESHOLD) / (1.0 - SPIKE_THRESHOLD)
             score = max(0.0, score - excess * 10.0)
 
-        # Organic bonus for very consistent volume
         if pattern in ("ORGANIC", "CONSISTENT") and cv < 0.20:
             score = min(100.0, score + 10.0)
 
@@ -250,22 +199,14 @@ class LiquidityGrowthAnalyzer:
         """
         _safe = LiquidityGrowthResult(token_address=token_address)
         try:
-            # Fetch candles — Birdeye if configured, otherwise DexScreener
-            if self._has_birdeye():
-                candles = await self._fetch_birdeye_ohlcv(token_address)
-            else:
-                candles = []
-
-            if not candles:
-                candles = await self._fetch_dexscreener_ohlcv(token_address)
+            candles = await self._fetch_dexscreener_candles(token_address)
 
             if not candles:
                 logger.debug(
-                    f"LiquidityGrowthAnalyzer: no candles for {token_address[:12]}..."
+                    f"LiquidityGrowthAnalyzer: no data for {token_address[:12]}..."
                 )
                 return _safe
 
-            # Sort oldest → newest
             candles.sort(key=lambda c: c.timestamp)
 
             volumes     = [c.volume for c in candles]
@@ -281,7 +222,6 @@ class LiquidityGrowthAnalyzer:
             pattern = self._classify_pattern(volumes, first_pct, cv)
             score   = self._score_pattern(pattern, cv, first_pct)
 
-            # Growth rate: (last_close - first_open) / first_open * 100
             growth_rate = 0.0
             if candles[0].open > 0:
                 growth_rate = (

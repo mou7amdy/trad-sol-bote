@@ -1,7 +1,6 @@
 import asyncio
 import json
 import base64
-import struct
 import httpx
 import websockets
 from typing import Any, Callable, Dict, List, Optional
@@ -44,6 +43,11 @@ class TokenInfo:
         self.market_cap = market_cap
         self.dex_source = dex_source
         self.detection_latency_ms = detection_latency_ms
+        self.buy_sell_ratio: float = 1.0
+        self.volume_5m: float = 0.0
+        self.top10_holders_pct: float = 0.0
+        self.lp_burned: bool = False
+        self.mint_revoked: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -147,37 +151,29 @@ async def _fetch_transaction(signature: str) -> Optional[Dict[str, Any]]:
 
 
 async def get_token_info(mint_address: str) -> "TokenInfo":
-    """Fetch token info from Birdeye API."""
-    url = f"https://public-api.birdeye.so/defi/token_overview?address={mint_address}"
-    headers: Dict[str, str] = {"x-chain": "solana"}
-    if settings.BIRDEYE_API_KEY and not settings.BIRDEYE_API_KEY.startswith("your_"):
-        headers["X-API-KEY"] = settings.BIRDEYE_API_KEY
-    else:
-        logger.debug(f"Mocking Birdeye token info for: {mint_address}")
-        return TokenInfo(
-            address=mint_address,
-            symbol="MOCK",
-            name="Mock Token",
-            price=0.05,
-            liquidity_usd=25000.0,
-            market_cap=500000.0,
-        )
-
+    """Fetch token info from DexScreener (free, no API key)."""
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint_address}"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, headers=headers)
+            response = await client.get(url)
             if response.status_code == 200:
-                data = response.json().get("data", {})
+                data = response.json()
+                pairs = data.get("pairs") or []
+                solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+                if not solana_pairs:
+                    return TokenInfo(address=mint_address, symbol="UNKNOWN", name="Unknown Token")
+                best = max(solana_pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                base = best.get("baseToken", {})
                 return TokenInfo(
                     address=mint_address,
-                    symbol=data.get("symbol", "UNKNOWN"),
-                    name=data.get("name", "Unknown Token"),
-                    price=float(data.get("price", 0.0)),
-                    liquidity_usd=float(data.get("liquidity", 0.0)),
-                    market_cap=float(data.get("mc", 0.0)),
+                    symbol=base.get("symbol", "UNKNOWN"),
+                    name=base.get("name", "Unknown Token"),
+                    price=float(best.get("priceUsd", 0) or 0),
+                    liquidity_usd=float(best.get("liquidity", {}).get("usd", 0) or 0),
+                    market_cap=float(best.get("marketCap", 0) or 0) or float(best.get("fdv", 0) or 0),
                 )
     except Exception as e:
-        logger.error(f"Error fetching token info from Birdeye: {e}")
+        logger.error(f"Error fetching token info from DexScreener: {e}")
 
     return TokenInfo(address=mint_address, symbol="UNKNOWN", name="Unknown Token")
 

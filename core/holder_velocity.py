@@ -65,7 +65,7 @@ class HolderVelocityResult:
     velocity_label:        str         # "STRONG" | "MODERATE" | "SLOW" | "STAGNANT" | "DROPPING"
     is_rug_warning:        bool        # sudden holder drop > 10% from peak
     holder_velocity_score: float       # 0–100
-    data_source:           str         # "birdeye" | "rpc_estimate" | "cache"
+    data_source:           str         # "rpc_estimate" | "cache"
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +81,6 @@ class HolderVelocityTracker:
     """
 
     def __init__(self) -> None:
-        self._birdeye_key: str = getattr(settings, "BIRDEYE_API_KEY", "")
         self._rpc_url: str = settings.SOLANA_RPC_URL
         # token_address → deque of _HolderSnapshot
         self._snapshots: dict[str, deque] = {}
@@ -93,49 +92,6 @@ class HolderVelocityTracker:
     # ------------------------------------------------------------------
     # API helpers
     # ------------------------------------------------------------------
-
-    def _has_birdeye(self) -> bool:
-        return bool(
-            self._birdeye_key
-            and not self._birdeye_key.startswith("your_")
-        )
-
-    async def _fetch_holder_count_birdeye(self, token_address: str) -> Optional[int]:
-        """
-        Fetch total unique holder count from Birdeye v3 API.
-        Returns None on any failure.
-        """
-        if not self._has_birdeye():
-            return None
-        url = (
-            f"https://public-api.birdeye.so/defi/v3/token/holder"
-            f"?address={token_address}&offset=0&limit=1"
-        )
-        headers = {"x-chain": "solana", "X-API-KEY": self._birdeye_key}
-        try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    total: Optional[int] = (
-                        data.get("data", {}).get("total")
-                        if isinstance(data.get("data"), dict)
-                        else None
-                    )
-                    if isinstance(total, int):
-                        logger.debug(
-                            f"Birdeye holder count for {token_address[:12]}...: {total}"
-                        )
-                        return total
-                elif resp.status_code == 429:
-                    logger.warning("Birdeye holder API rate-limited.")
-                else:
-                    logger.warning(
-                        f"Birdeye holder API HTTP {resp.status_code} for {token_address[:12]}..."
-                    )
-        except Exception as exc:
-            logger.error(f"_fetch_holder_count_birdeye error: {exc}")
-        return None
 
     async def _fetch_holder_count_rpc(self, token_address: str) -> Optional[int]:
         """
@@ -172,13 +128,9 @@ class HolderVelocityTracker:
 
     async def _fetch_holder_count(self, token_address: str) -> tuple[int, str]:
         """
-        Fetch holder count from the best available source.
+        Fetch holder count from RPC (free fallback).
         Returns ``(count, source_label)``.
         """
-        count = await self._fetch_holder_count_birdeye(token_address)
-        if count is not None:
-            return count, "birdeye"
-
         count = await self._fetch_holder_count_rpc(token_address)
         if count is not None:
             return count, "rpc_estimate"

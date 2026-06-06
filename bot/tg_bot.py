@@ -21,15 +21,17 @@ Enrichment pipeline (per token, all concurrent via SpeedOptimizer)
   holder_velocity — holder growth rate (Phase 1)
   smart_money    — first-buyer wallet profiling (Phase 1)
 
-Signal scoring (Phase 1 formula, weights sum to 1.00)
+Signal scoring (Phase 2 formula, weights sum to 1.00)
 ------------------------------------------------------
   SIGNAL_SCORE =
-      security_score        × 0.25
-    + wallet_score          × 0.20
-    + rug_score             × 0.20
-    + holder_velocity_score × 0.15
-    + smart_money_score     × 0.15
-    + social_score          × 0.05
+      security_score          × 0.20
+    + wallet_score            × 0.15
+    + rug_score               × 0.15
+    + holder_velocity_score   × 0.15
+    + smart_money_score       × 0.15
+    + tx_pattern_score        × 0.10
+    + social_score            × 0.05
+    + cross_dex_score         × 0.05
 
 Feature flags (set in .env)
 ---------------------------
@@ -87,6 +89,7 @@ from api.event_bus import event_bus
 from core.tx_pattern_scorer import TxPatternScorer
 from core.liquidity_growth_analyzer import LiquidityGrowthAnalyzer
 from core.cross_dex_monitor import CrossDexMonitor
+from core.shared_state import shared_state
 # --- Phase 3: Auto-trading ---
 from trading.swap_engine       import swap_engine, SwapEngine
 from trading.circuit_breaker   import circuit_breaker
@@ -149,13 +152,13 @@ async def _send_admin(text: str) -> None:
 
 def _autobuy_active() -> bool:
     """True when auto-buy has been explicitly enabled and not expired."""
-    if not settings.ENABLE_AUTO_BUY:
+    if not shared_state.autobuy_enabled:
         return False
     if _state.autobuy_enabled_until <= 0:
         return False
     if time.monotonic() > _state.autobuy_enabled_until:
         # Auto-disable
-        settings.ENABLE_AUTO_BUY = False
+        shared_state.autobuy_enabled = False
         _state.autobuy_enabled_until = 0.0
         logger.info("Auto-buy 24h window expired — disabled.")
         asyncio.create_task(_send_admin(
@@ -191,7 +194,7 @@ async def cmd_status(message: Message) -> None:
     avg_time      = _speed_optimizer.get_avg_processing_time()
     cb_state      = circuit_breaker.get_state()
     autobuy_state = "🟢 ON" if _autobuy_active() else "🔴 OFF"
-    autosell_state = "🟢 ON" if settings.ENABLE_AUTO_SELL else "🔴 OFF"
+    autosell_state = "🟢 ON" if shared_state.autosell_enabled else "🔴 OFF"
     await message.answer(
         f"🤖 **Bot Status:** {status_text}\n"
         f"🔍 **Tokens Scanned:** `{_state.processed_tokens_count}`\n"
@@ -352,9 +355,9 @@ async def cmd_enable_autobuy(message: Message) -> None:
 @router.message(Command("disable_autobuy"))
 async def cmd_disable_autobuy(message: Message) -> None:
     """Immediately disable auto-buy."""
-    settings.ENABLE_AUTO_BUY        = False
-    _state.autobuy_enabled_until    = 0.0
-    _state.autobuy_confirm_pending  = False
+    shared_state.autobuy_enabled   = False
+    _state.autobuy_enabled_until   = 0.0
+    _state.autobuy_confirm_pending = False
     await message.answer("🔴 *Auto-buy disabled.*", parse_mode="Markdown")
 
 
@@ -370,8 +373,8 @@ async def handle_text_message(message: Message) -> None:
         and message.text.strip() == "CONFIRM BUY"
     ):
         _state.autobuy_confirm_pending = False
-        settings.ENABLE_AUTO_BUY      = True
-        settings.ENABLE_AUTO_SELL     = True   # enable sell side too
+        shared_state.autobuy_enabled  = True
+        shared_state.autosell_enabled = True   # enable sell side too
         _state.autobuy_enabled_until  = time.monotonic() + 86_400  # 24 h
         await message.answer(
             "🟢 *Auto-buy ENABLED*\n"
@@ -767,7 +770,19 @@ async def handle_new_token(
                 "prices":         cdx_result.prices,
             })
 
-        # ── 6. Gate evaluation ─────────────────────────────────────────
+        # ── 6. Propagate F1-F6 fields to token_info for ML ─────────────
+        if txp_result and txp_result.total_txs > 0:
+            token_info.buy_sell_ratio = txp_result.buy_sell_ratio
+        if analysis_res:
+            token_info.volume_5m = analysis_res.volume_5m
+        if security_res:
+            token_info.top10_holders_pct = security_res.top10_holders_pct
+            token_info.lp_burned = security_res.lp_burned
+            token_info.mint_revoked = security_res.mint_revoked
+        if wallet_result:
+            token_info.is_dev_cluster = getattr(wallet_result, 'is_dev_cluster', False)
+
+        # ── 7. Gate evaluation ─────────────────────────────────────────
         if not security_res:
             logger.warning(f"Security scan timed out for {_addr} — skipping.")
             return
@@ -807,7 +822,7 @@ async def handle_new_token(
             "reason": decision.reason,
         })
 
-        # ── 7. Send alert + auto-buy logic ────────────────────────────────
+        # ── 8. Send alert + auto-buy logic ────────────────────────────────
         if decision.send:
             msg = format_signal_message(
                 token_info,
@@ -822,6 +837,7 @@ async def handle_new_token(
                 liquidity_growth=liq_result,
                 cross_dex=cdx_result,
                 composite_score=decision.composite_score,
+                ml_pred=getattr(decision, 'ml_pred', None),
             )
             await send_signal(msg)
             dex_name = getattr(token_info, "dex_source", "Raydium_AMM")
@@ -835,7 +851,7 @@ async def handle_new_token(
                 "result":           "Alerted",
             })
 
-            # ── 8. Auto-buy (───────────────────────────────────────────
+            # ── 9. Auto-buy (───────────────────────────────────────────
             if decision.buy_recommended:
                 if settings.ENABLE_CIRCUIT_BREAKER and circuit_breaker.is_active():
                     cb_state = circuit_breaker.get_state()

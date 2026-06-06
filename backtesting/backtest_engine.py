@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
+import httpx
 import numpy as np
 from loguru import logger
 
@@ -42,8 +43,31 @@ OPT_PARAMS_PATH   = MODELS_DIR / "optimal_parameters.json"
 
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-SOL_PRICE_USD     = 150.0     # approximate; used to convert USD liquidity to SOL
 REALISTIC_FEE_SOL = 0.002     # per trade (both buy + sell)
+
+
+# ---------------------------------------------------------------------------
+# Live SOL price fetcher (replaces hardcoded constant)
+# ---------------------------------------------------------------------------
+
+async def _fetch_sol_price_usd() -> float:
+    """
+    Fetch current SOL/USD price from CoinGecko.
+    Returns 150.0 as a fallback on error.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                price = data.get("solana", {}).get("usd")
+                if price:
+                    return float(price)
+    except Exception as exc:
+        logger.warning(f"Failed to fetch SOL price from CoinGecko: {exc}")
+    return 150.0
 
 # ---------------------------------------------------------------------------
 # Grid-search parameter space (336 combinations)
@@ -820,6 +844,8 @@ class BacktestEngine:
 
     async def run(self, limit: int = 0) -> SimResult:
         """Full pipeline: load tokens → grid search → export."""
+        sol_price = await _fetch_sol_price_usd()
+        logger.info(f"BacktestEngine: SOL price = ${sol_price:.2f}")
         await self.start()
         try:
             best = await self.run_grid_search(limit=limit)

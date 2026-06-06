@@ -38,17 +38,14 @@ from tqdm.asyncio import tqdm as atqdm
 try:
     from config.settings import settings
     _HELIUS_API_KEY: str = settings.HELIUS_API_KEY
-    _BIRDEYE_API_KEY: str = settings.BIRDEYE_API_KEY
 except Exception:  # pragma: no cover
     logger.warning("Could not import settings; falling back to empty API keys.")
 
     class _FallbackSettings:  # type: ignore[no-redef]
         HELIUS_API_KEY: str = ""
-        BIRDEYE_API_KEY: str = ""
 
     settings = _FallbackSettings()  # type: ignore[assignment]
     _HELIUS_API_KEY = ""
-    _BIRDEYE_API_KEY = ""
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -57,7 +54,6 @@ BACKTEST_DB_PATH: Path = Path(__file__).parent.parent / "data" / "backtest.db"
 
 GECKO_BASE: str = "https://api.geckoterminal.com/api/v2"
 DEX_BASE: str = "https://api.dexscreener.com/latest/dex"
-BIRDEYE_BASE: str = "https://public-api.birdeye.so/public"
 SOLSCAN_BASE: str = "https://public-api.solscan.io"
 HELIUS_BASE: str = "https://api.helius.xyz/v0"
 
@@ -230,7 +226,6 @@ class DataCollector:
         # Helius credit tracking
         self._helius_credits: int = 0
         self._helius_api_key: str = getattr(settings, "HELIUS_API_KEY", "")
-        self._birdeye_api_key: str = getattr(settings, "BIRDEYE_API_KEY", "")
 
         # Insert buffer
         self._insert_buffer: list[dict] = []
@@ -596,12 +591,12 @@ class DataCollector:
             return None
 
     # ------------------------------------------------------------------
-    # Source 3 — Birdeye OHLCV enrichment
+    # Source 3 — GeckoTerminal OHLCV enrichment (free, no API key)
     # ------------------------------------------------------------------
 
-    async def enrich_with_birdeye(self, mint: str, created_at: int) -> dict:
+    async def enrich_with_geckoterminal(self, mint: str, created_at: int) -> dict:
         """
-        Fetch 1-minute OHLCV candles from Birdeye for the first hour post-launch.
+        Fetch price checkpoints from GeckoTerminal for the first hour post-launch.
 
         Args:
             mint: Token mint address.
@@ -612,48 +607,41 @@ class DataCollector:
         """
         if not created_at:
             return {}
-
         try:
-            url = f"{BIRDEYE_BASE}/history_price"
-            params = {
-                "address": mint,
-                "address_type": "token",
-                "type": "1m",
-                "time_from": str(created_at),
-                "time_to": str(created_at + 3600),
-            }
-            headers: dict = {}
-            if self._birdeye_api_key and "your_" not in self._birdeye_api_key:
-                headers["X-API-KEY"] = self._birdeye_api_key
-
-            data = await self._get(url, params=params, extra_headers=headers if headers else None)
+            url = f"{GECKO_BASE}/networks/solana/tokens/{mint}/pools"
+            data = await self._get(url)
             if not data:
                 return {}
-
-            items: list[dict] = data.get("data", {}).get("items", [])
+            pools = data.get("data", [])
+            if not pools:
+                return {}
+            pool_id = pools[0].get("id", "")
+            if not pool_id:
+                return {}
+            ohlcv_url = f"{GECKO_BASE}/networks/solana/pools/{pool_id}/ohlcv/1m"
+            ohlcv_data = await self._get(ohlcv_url, params={"limit": "60"})
+            if not ohlcv_data:
+                return {}
+            items = (ohlcv_data.get("data") or {}).get("attributes", {}).get("ohlcv_list", [])
             if not items:
                 return {}
-
-            # Build a map: minute_offset → close price
             price_map: dict[int, float] = {}
-            for candle in items:
-                ts: int = _safe_int(candle.get("unixTime", 0))
-                if not ts:
-                    continue
-                offset_min: int = (ts - created_at) // 60
-                close: float = _safe_float(candle.get("c") or candle.get("value"))
-                if close > 0:
-                    price_map[offset_min] = close
-
+            for item in items:
+                if len(item) >= 5:
+                    ts = int(item[0])
+                    close = float(item[4])
+                    if close > 0 and ts > 0:
+                        offset_min = abs((ts - created_at)) // 60 if created_at else 0
+                        if offset_min <= 1440:
+                            price_map[offset_min] = close
             if not price_map:
                 return {}
 
             def _get_price_at(target_min: int) -> float:
-                """Find the closest available price at or just before target_min."""
                 candidates = [
                     (abs(m - target_min), p)
                     for m, p in price_map.items()
-                    if m <= target_min + 2  # allow 2-min grace
+                    if m <= target_min + 2
                 ]
                 if not candidates:
                     return 0.0
@@ -677,9 +665,8 @@ class DataCollector:
                 "max_price_time_min": max_price_min,
                 "price_at_24hr": _get_price_at(1440),
             }
-
         except Exception as exc:
-            logger.debug("Birdeye enrich error for {}: {}", mint, exc)
+            logger.debug("GeckoTerminal enrich error for {}: {}", mint, exc)
             return {}
 
     # ------------------------------------------------------------------
@@ -1074,21 +1061,21 @@ class DataCollector:
         created_at: int = _safe_int(token.get("created_at", 0))
 
         # Parallel enrichment — run all three concurrently
-        birdeye_task = asyncio.create_task(self.enrich_with_birdeye(mint, created_at))
+        geo_task = asyncio.create_task(self.enrich_with_geckoterminal(mint, created_at))
         helius_task = asyncio.create_task(self.enrich_with_helius(mint))
         solscan_task = asyncio.create_task(self.enrich_with_solscan(mint))
 
-        birdeye_data, helius_data, solscan_data = await asyncio.gather(
-            birdeye_task, helius_task, solscan_task, return_exceptions=False
+        geo_data, helius_data, solscan_data = await asyncio.gather(
+            geo_task, helius_task, solscan_task, return_exceptions=False
         )
 
         # Merge enrichment results into token dict
         merged: dict = {**token}
-        for enrichment in (birdeye_data, helius_data, solscan_data):
+        for enrichment in (geo_data, helius_data, solscan_data):
             if isinstance(enrichment, dict):
                 merged.update(enrichment)
 
-        # Fallback for missing price checkpoints if Birdeye failed/skipped
+        # Fallback for missing price checkpoints if GeckoTerminal failed/skipped
         _has_synthetic_data = False
         if merged.get("price_at_5min", 0.0) <= 0.0:
             logger.warning("No real price data for {} — marking incomplete.", mint)
@@ -1155,7 +1142,7 @@ class DataCollector:
           1. Collect pools from GeckoTerminal.
           2. Collect pairs from DexScreener.
           3. Deduplicate by mint address.
-          4. For each unique token: enrich (Birdeye + Helius + Solscan).
+          4. For each unique token: enrich (GeckoTerminal + Helius + Solscan).
           5. Compute outcome labels.
           6. Upsert into SQLite.
 
@@ -1318,28 +1305,6 @@ class DataCollector:
             logger.success("DexScreener ✓  ({} pairs returned)", pair_count)
         else:
             logger.error("DexScreener ✗  (no data returned)")
-
-        # Birdeye — use a well-known token (BONK)
-        bonk_mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
-        birdeye_url = f"{BIRDEYE_BASE}/history_price"
-        birdeye_params = {
-            "address": bonk_mint,
-            "address_type": "token",
-            "type": "1m",
-            "time_from": str(int(time.time()) - 3600),
-            "time_to": str(int(time.time())),
-        }
-        birdeye_headers = {}
-        if self._birdeye_api_key and "your_" not in self._birdeye_api_key:
-            birdeye_headers["X-API-KEY"] = self._birdeye_api_key
-        birdeye_data = await self._get(
-            birdeye_url, params=birdeye_params,
-            extra_headers=birdeye_headers if birdeye_headers else None
-        )
-        if birdeye_data and birdeye_data.get("data"):
-            logger.success("Birdeye ✓  (history_price responded)")
-        else:
-            logger.warning("Birdeye ✗  (no data — may need API key)")
 
         # Helius
         if self._helius_api_key and "your_" not in self._helius_api_key:
