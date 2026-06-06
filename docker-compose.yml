@@ -1,0 +1,41 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-botpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-signals}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bot} -d ${POSTGRES_DB:-signals}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bot}:${POSTGRES_PASSWORD:-botpassword}@db:5432/${POSTGRES_DB:-signals}
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:?required}
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:?required}
+      GOPLUS_API_KEY: ${GOPLUS_API_KEY:?required}
+      HONEYPOT_API_KEY: ${HONEYPOT_API_KEY:?required}
+      HELIUS_API_KEY: ${HELIUS_API_KEY:-}
+      TWITTER_BEARER_TOKEN: ${TWITTER_BEARER_TOKEN:-}
+      ENABLE_DASHBOARD: "true"
+      DASHBOARD_PORT: "8000"
+      DASHBOARD_API_KEY: ${DASHBOARD_API_KEY:-change-me-in-production}
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
