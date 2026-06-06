@@ -7,3 +7,4 @@ data/
 archive/
 *.db
 *.sqlite
+dashboard/node_modules/
