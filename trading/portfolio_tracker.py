@@ -6,7 +6,7 @@ Tables managed here:
   trades       — one row per open/closed position
   daily_stats  — one row per UTC day
 
-All writes go through the shared aiosqlite connection opened by init_db().
+All writes go through the shared DatabaseClient opened by init_db().
 This module ONLY writes to its own tables; it never touches the existing
 signal/scan/token tables.
 """
@@ -19,10 +19,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, date
 from typing import Any, Dict, List, Optional
 
-import aiosqlite
 from loguru import logger
 
 from config.settings import settings
+from database.db import DatabaseClient
 
 # ---------------------------------------------------------------------------
 # Table DDL  (CREATE IF NOT EXISTS — safe to run every startup)
@@ -150,26 +150,26 @@ class DailyStats:
 
 class PortfolioTracker:
     """
-    Manages the trades + daily_stats SQLite tables.
+    Manages the trades + daily_stats tables.
 
-    Uses the **same** aiosqlite connection as the rest of the bot
-    (injected via ``set_db_connection``).  Call this after init_db().
+    Uses the **same** DatabaseClient as the rest of the bot
+    (injected via ``set_db``).  Call this after init_db().
     """
 
     def __init__(self) -> None:
-        self._db: Optional[aiosqlite.Connection] = None
+        self._db: Optional[DatabaseClient] = None
         self._lock = asyncio.Lock()
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
-    def set_db_connection(self, conn: aiosqlite.Connection) -> None:
-        """Inject the shared connection opened by sqlite_client.init_db()."""
-        self._db = conn
+    def set_db(self, db_client: DatabaseClient) -> None:
+        """Inject the shared DatabaseClient from database.db."""
+        self._db = db_client
 
     async def ensure_tables(self) -> None:
         """Create trades + daily_stats tables if they don't exist yet."""
         if not self._db:
-            raise RuntimeError("PortfolioTracker: no DB connection. Call set_db_connection first.")
+            raise RuntimeError("PortfolioTracker: no DB connection. Call set_db first.")
         await self._db.execute(CREATE_TRADES_TABLE)
         await self._db.execute(CREATE_TRADES_INDEX)
         await self._db.execute(CREATE_TRADES_STATUS_INDEX)
@@ -184,13 +184,23 @@ class PortfolioTracker:
 
     async def _ensure_daily_row(self, today: str, starting_balance: float = 0.0) -> None:
         """Insert a daily_stats row for today if it doesn't exist."""
-        await self._db.execute(
-            """
-            INSERT OR IGNORE INTO daily_stats (date, starting_balance_sol, ending_balance_sol)
-            VALUES (?, ?, ?)
-            """,
-            (today, starting_balance, starting_balance),
-        )
+        if self._db and self._db.is_postgres:
+            await self._db.execute(
+                """
+                INSERT INTO daily_stats (date, starting_balance_sol, ending_balance_sol)
+                VALUES (?, ?, ?)
+                ON CONFLICT (date) DO NOTHING
+                """,
+                (today, starting_balance, starting_balance),
+            )
+        else:
+            await self._db.execute(
+                """
+                INSERT OR IGNORE INTO daily_stats (date, starting_balance_sol, ending_balance_sol)
+                VALUES (?, ?, ?)
+                """,
+                (today, starting_balance, starting_balance),
+            )
         await self._db.commit()
 
     # ── core trade operations ──────────────────────────────────────────────
@@ -215,21 +225,24 @@ class PortfolioTracker:
             today = self._today_utc()
             await self._ensure_daily_row(today)
 
-            cursor = await self._db.execute(
-                """
+            sql = """
                 INSERT INTO trades (
                     mint_address, symbol, entry_price, entry_sol,
                     tokens_received, current_price, current_value_sol,
                     signal_score, highest_price, tx_signature_buy
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    mint_address, symbol, entry_price, entry_sol,
-                    tokens_received, entry_price, entry_sol,
-                    signal_score, entry_price, tx_signature,
-                ),
+                """
+            params = (
+                mint_address, symbol, entry_price, entry_sol,
+                tokens_received, entry_price, entry_sol,
+                signal_score, entry_price, tx_signature,
             )
-            trade_id = cursor.lastrowid
+
+            if self._db.is_postgres:
+                trade_id = await self._db.fetchval(sql + " RETURNING id", params)
+            else:
+                cursor = await self._db.execute(sql, params)
+                trade_id = cursor.lastrowid
 
             # bump today's total
             await self._db.execute(
@@ -242,7 +255,7 @@ class PortfolioTracker:
             f"PortfolioTracker: recorded BUY trade_id={trade_id} "
             f"mint={mint_address[:8]}… sol={entry_sol:.4f}"
         )
-        return trade_id  # type: ignore[return-value]
+        return trade_id
 
     async def record_sell(
         self,
@@ -378,30 +391,26 @@ class PortfolioTracker:
         import json
         if not self._db:
             return None
-        async with self._db.execute(
+        row = await self._db.fetchone(
             "SELECT * FROM trades WHERE id = ?", (trade_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["tp_rungs_hit"] = json.loads(d.get("tp_rungs_hit") or "[]")
-            return TradeRecord(**d)
+        )
+        if not row:
+            return None
+        row["tp_rungs_hit"] = json.loads(row.get("tp_rungs_hit") or "[]")
+        return TradeRecord(**row)
 
     async def get_open_trades(self) -> List[TradeRecord]:
         """Return all currently open trades."""
         import json
         if not self._db:
             return []
-        async with self._db.execute(
+        rows = await self._db.fetchall(
             "SELECT * FROM trades WHERE status = 'open' ORDER BY entry_time DESC"
-        ) as cur:
-            rows = await cur.fetchall()
+        )
         result = []
         for row in rows:
-            d = dict(row)
-            d["tp_rungs_hit"] = json.loads(d.get("tp_rungs_hit") or "[]")
-            result.append(TradeRecord(**d))
+            row["tp_rungs_hit"] = json.loads(row.get("tp_rungs_hit") or "[]")
+            result.append(TradeRecord(**row))
         return result
 
     async def get_open_trade_by_mint(self, mint_address: str) -> Optional[TradeRecord]:
@@ -409,33 +418,29 @@ class PortfolioTracker:
         import json
         if not self._db:
             return None
-        async with self._db.execute(
+        row = await self._db.fetchone(
             "SELECT * FROM trades WHERE mint_address = ? AND status = 'open' LIMIT 1",
             (mint_address,),
-        ) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["tp_rungs_hit"] = json.loads(d.get("tp_rungs_hit") or "[]")
-            return TradeRecord(**d)
+        )
+        if not row:
+            return None
+        row["tp_rungs_hit"] = json.loads(row.get("tp_rungs_hit") or "[]")
+        return TradeRecord(**row)
 
     async def count_open_trades(self) -> int:
         """Return number of currently open positions."""
         if not self._db:
             return 0
-        async with self._db.execute(
+        return await self._db.fetchval(
             "SELECT COUNT(*) FROM trades WHERE status = 'open'"
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+        ) or 0
 
     async def get_closed_trades(self, limit: int = 10) -> List[TradeRecord]:
         """Return the last N closed/emergency_sold trades."""
         import json
         if not self._db:
             return []
-        async with self._db.execute(
+        rows = await self._db.fetchall(
             """
             SELECT * FROM trades
             WHERE status IN ('closed','emergency_sold')
@@ -443,13 +448,11 @@ class PortfolioTracker:
             LIMIT ?
             """,
             (limit,),
-        ) as cur:
-            rows = await cur.fetchall()
+        )
         result = []
         for row in rows:
-            d = dict(row)
-            d["tp_rungs_hit"] = json.loads(d.get("tp_rungs_hit") or "[]")
-            result.append(TradeRecord(**d))
+            row["tp_rungs_hit"] = json.loads(row.get("tp_rungs_hit") or "[]")
+            result.append(TradeRecord(**row))
         return result
 
     async def get_today_stats(self) -> Optional[DailyStats]:
@@ -457,13 +460,12 @@ class PortfolioTracker:
         if not self._db:
             return None
         today = self._today_utc()
-        async with self._db.execute(
+        row = await self._db.fetchone(
             "SELECT * FROM daily_stats WHERE date = ?", (today,)
-        ) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return None
-            return DailyStats(**dict(row))
+        )
+        if not row:
+            return None
+        return DailyStats(**row)
 
     async def get_daily_pnl(self) -> float:
         """Return today's realized P&L in SOL (0.0 if no row yet)."""

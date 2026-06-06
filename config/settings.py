@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     GOPLUS_API_KEY: str = Field(default="your_goplus_api_key_here")
     HONEYPOT_API_KEY: str = Field(default="your_honeypot_api_key_here")
     SQLITE_DB_PATH: str = Field(default=str(BASE_DIR / "data" / "bot.db"))
+    DATABASE_URL: str = Field(default="")
 
     # --- Enhancement settings ---
     # Twitter / X API v2 bearer token for social signal scanning

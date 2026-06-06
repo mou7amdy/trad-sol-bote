@@ -21,10 +21,10 @@ from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Callable, Coroutine, List, Optional, Any
 
-import aiosqlite
 from loguru import logger
 
 from config.settings import settings, runtime_state
+from database.db import DatabaseClient
 
 # ---------------------------------------------------------------------------
 # Enums + state dataclass
@@ -85,7 +85,7 @@ class CircuitBreaker:
     Usage::
 
         circuit_breaker = CircuitBreaker()
-        circuit_breaker.set_db_connection(conn)
+        circuit_breaker.set_db(db_client)
         circuit_breaker.set_alert_fn(send_telegram_alert)
 
         # in trade logic:
@@ -102,7 +102,7 @@ class CircuitBreaker:
     def __init__(self) -> None:
         self._state  = BreakerState()
         self._lock   = asyncio.Lock()
-        self._db: Optional[aiosqlite.Connection] = None
+        self._db: Optional[DatabaseClient] = None
         self._alert_fn: Optional[Callable[[str], Coroutine[Any, Any, None]]] = None
 
         # market-condition tracking
@@ -116,8 +116,8 @@ class CircuitBreaker:
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
-    def set_db_connection(self, conn: aiosqlite.Connection) -> None:
-        self._db = conn
+    def set_db(self, db_client: DatabaseClient) -> None:
+        self._db = db_client
 
     def set_alert_fn(
         self, fn: Callable[[str], Coroutine[Any, Any, None]]
@@ -199,22 +199,47 @@ class CircuitBreaker:
         if not self._db:
             return
         try:
-            await self._db.execute(
-                """
-                INSERT OR REPLACE INTO circuit_breaker_state
-                    (id, level, reason, consecutive_losses,
-                     daily_loss_pct, triggered_at, paused_until_ts)
-                VALUES (1, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    self._state.level.value,
-                    self._state.reason,
-                    self._state.consecutive_losses,
-                    self._state.daily_loss_pct,
-                    datetime.now(timezone.utc).isoformat(),
-                    self._state.paused_until or 0.0,
-                ),
-            )
+            if self._db.is_postgres:
+                await self._db.execute(
+                    """
+                    INSERT INTO circuit_breaker_state
+                        (id, level, reason, consecutive_losses,
+                         daily_loss_pct, triggered_at, paused_until_ts)
+                    VALUES (1, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (id) DO UPDATE SET
+                        level = EXCLUDED.level,
+                        reason = EXCLUDED.reason,
+                        consecutive_losses = EXCLUDED.consecutive_losses,
+                        daily_loss_pct = EXCLUDED.daily_loss_pct,
+                        triggered_at = EXCLUDED.triggered_at,
+                        paused_until_ts = EXCLUDED.paused_until_ts
+                    """,
+                    (
+                        self._state.level.value,
+                        self._state.reason,
+                        self._state.consecutive_losses,
+                        self._state.daily_loss_pct,
+                        datetime.now(timezone.utc).isoformat(),
+                        self._state.paused_until or 0.0,
+                    ),
+                )
+            else:
+                await self._db.execute(
+                    """
+                    INSERT OR REPLACE INTO circuit_breaker_state
+                        (id, level, reason, consecutive_losses,
+                         daily_loss_pct, triggered_at, paused_until_ts)
+                    VALUES (1, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._state.level.value,
+                        self._state.reason,
+                        self._state.consecutive_losses,
+                        self._state.daily_loss_pct,
+                        datetime.now(timezone.utc).isoformat(),
+                        self._state.paused_until or 0.0,
+                    ),
+                )
             await self._db.commit()
         except Exception as exc:
             logger.error(f"CircuitBreaker: persist error: {exc}")
@@ -402,32 +427,28 @@ class CircuitBreaker:
         if not self._db:
             return
         try:
-            async with self._db.execute(
+            row = await self._db.fetchone(
                 "SELECT * FROM circuit_breaker_state WHERE id = 1"
-            ) as cur:
-                row = await cur.fetchone()
-                if not row:
-                    return
-                d = dict(row)
-                self._state.level              = BreakerLevel(d["level"])
-                self._state.reason             = d["reason"]
-                self._state.consecutive_losses = d["consecutive_losses"]
-                self._state.daily_loss_pct     = d["daily_loss_pct"]
-                saved_paused_until = d.get("paused_until_ts", 0.0)
-                # saved_paused_until is a wall-clock offset; convert to monotonic
-                # We can't perfectly reconstruct monotonic, so we clear it if past
-                if saved_paused_until > time.time():
-                    self._state.paused_until = (
-                        time.monotonic() + (saved_paused_until - time.time())
-                    )
-                else:
-                    self._state.paused_until = None
-                    if self._state.level in (
-                        BreakerLevel.PAUSE_30M,
-                        BreakerLevel.PAUSE_2H,
-                        BreakerLevel.STOP_24H,
-                    ):
-                        self._state.level = BreakerLevel.OK
+            )
+            if not row:
+                return
+            self._state.level              = BreakerLevel(row["level"])
+            self._state.reason             = row["reason"]
+            self._state.consecutive_losses = row["consecutive_losses"]
+            self._state.daily_loss_pct     = row["daily_loss_pct"]
+            saved_paused_until = row.get("paused_until_ts", 0.0)
+            if saved_paused_until > time.time():
+                self._state.paused_until = (
+                    time.monotonic() + (saved_paused_until - time.time())
+                )
+            else:
+                self._state.paused_until = None
+                if self._state.level in (
+                    BreakerLevel.PAUSE_30M,
+                    BreakerLevel.PAUSE_2H,
+                    BreakerLevel.STOP_24H,
+                ):
+                    self._state.level = BreakerLevel.OK
 
             logger.info(
                 f"CircuitBreaker: loaded state={self._state.level.value} "
