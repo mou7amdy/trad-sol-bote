@@ -1,0 +1,15 @@
+[build]
+builder = "nixpacks"
+buildCommand = ""
+watchPatterns = ["api/**", "bot/**", "config/**", "core/**", "database/**", "security/**", "trading/**"]
+
+[deploy]
+startCommand = "python -m bot.tg_bot"
+healthcheckPath = "/health"
+restartPolicyType = "on_failure"
+
+[[deploy.healthchecks]]
+path = "/health"
+interval = 30
+timeout = 10
+retries = 3

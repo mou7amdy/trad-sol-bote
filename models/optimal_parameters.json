@@ -1,0 +1,36 @@
+{
+  "generated_at": 1780715391,
+  "backtest_summary": {
+    "total_trades": 0,
+    "win_rate": 0.0,
+    "sharpe_ratio": 0.0,
+    "profit_factor": 0.0,
+    "max_drawdown_pct": 0.0,
+    "total_pnl_sol": 0.0,
+    "total_pnl_pct": 0.0
+  },
+  "min_signal_score": 0.6,
+  "position_size_sol": 0.02,
+  "stop_loss_pct": 0.2,
+  "tp2x_fraction": 0.2,
+  "tp5x_fraction": 0.25,
+  "tp10x_fraction": 0.25,
+  "trailing_fraction": 0.30000000000000004,
+  "position_size_kelly": 0.1,
+  "trailing_stop_profit_300": 0.15,
+  "trailing_stop_profit_100": 0.2,
+  "trailing_stop_profit_50": 0.25,
+  "trailing_stop_default": 0.3,
+  "signal_weights": {
+    "security": 0.2,
+    "wallet": 0.15,
+    "rug": 0.15,
+    "holder_velocity": 0.15,
+    "smart_money": 0.15,
+    "tx_pattern": 0.1,
+    "social": 0.05,
+    "cross_dex": 0.05
+  },
+  "top_feature": "liquidity_velocity_ratio",
+  "rug_detection_accuracy": 50.0
+}
